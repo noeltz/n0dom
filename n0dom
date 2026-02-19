@@ -406,6 +406,7 @@ load_config() {
     N0DOM_REPO_PATH=$(get_config_value "repo.local_path" "$N0DOM_DEFAULT_REPO")
     N0DOM_BACKUP_RETENTION=$(get_config_value "backup.retention_days" "30")
     N0DOM_MAX_BACKUPS=$(get_config_value "backup.max_backups" "50")
+    N0DOM_CONFLICT_RESOLVER=$(get_config_value "sync.conflict_resolver" "auto")
     N0DOM_AUTO_COMMIT=$(get_config_value "sync.auto_commit" "false")
 }
 
@@ -431,7 +432,7 @@ backup:
 
 sync:
   symlink_mode: true
-  conflict_resolver: "meld"
+  conflict_resolver: "${N0DOM_CONFLICT_RESOLVER:-auto}"
   auto_commit: false
 EOF
     
@@ -867,6 +868,68 @@ sync_repo_to_home() {
     return 0
 }
 
+get_available_merge_tools() {
+    local tools=()
+    
+    # Check for common merge tools
+    if command -v meld &> /dev/null; then
+        tools+=("meld:Meld (GUI)")
+    fi
+    if command -v vimdiff &> /dev/null; then
+        tools+=("vimdiff:Vimdiff (CLI)")
+    fi
+    if command -v code &> /dev/null; then
+        tools+=("code:VS Code (GUI)")
+    fi
+    if command -v kdiff3 &> /dev/null; then
+        tools+=("kdiff3:KDiff3 (GUI)")
+    fi
+    if command -v diffuse &> /dev/null; then
+        tools+=("diffuse:Diffuse (GUI)")
+    fi
+    if command -v kompare &> /dev/null; then
+        tools+=("kompare:Kompare (GUI)")
+    fi
+    
+    echo "${tools[@]}"
+}
+
+run_merge_tool() {
+    local tool="$1"
+    local home_file="$2"
+    local temp_file="$3"
+    
+    case "$tool" in
+        meld)
+            meld "$home_file" "$temp_file"
+            return $?
+            ;;
+        vimdiff)
+            vimdiff "$home_file" "$temp_file"
+            return $?
+            ;;
+        code)
+            code --wait --diff "$home_file" "$temp_file"
+            return $?
+            ;;
+        kdiff3)
+            kdiff3 "$home_file" "$temp_file" -o "$temp_file"
+            return $?
+            ;;
+        diffuse)
+            diffuse "$home_file" "$temp_file"
+            return $?
+            ;;
+        kompare)
+            kompare "$home_file" "$temp_file"
+            return $?
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 resolve_two_way_conflict() {
     local file="$1"
     local repo_file="$N0DOM_REPO_PATH/$file"
@@ -874,57 +937,221 @@ resolve_two_way_conflict() {
     
     print_warning "Conflict detected: $file"
     print_info "Both home and repo versions have changed"
+    echo
     
-    if command -v meld &> /dev/null; then
-        print_info "Opening meld for merge resolution..."
-        local temp_file
-        temp_file=$(mktemp)
-        cp "$repo_file" "$temp_file"
-        meld "$home_file" "$temp_file"
-        
-        echo
-        read -p "Use merged version? [y=repo, n=home, c=cancel]: " -n 1 -r
+    local temp_file
+    temp_file=$(mktemp)
+    cp "$repo_file" "$temp_file"
+    
+    # Get available merge tools
+    local available_tools
+    available_tools=$(get_available_merge_tools)
+    
+    # Determine which tool to use
+    local selected_tool=""
+    local use_tool=false
+    
+    if [[ "$N0DOM_CONFLICT_RESOLVER" != "none" ]] && [[ "$N0DOM_CONFLICT_RESOLVER" != "manual" ]]; then
+        if [[ "$N0DOM_CONFLICT_RESOLVER" == "auto" ]]; then
+            # Auto-select first available tool
+            if [[ -n "$available_tools" ]]; then
+                selected_tool="${available_tools%%:*}"
+                use_tool=true
+            fi
+        else
+            # Use configured tool if available
+            if [[ "$available_tools" == *"$N0DOM_CONFLICT_RESOLVER"* ]]; then
+                selected_tool="$N0DOM_CONFLICT_RESOLVER"
+                use_tool=true
+            else
+                print_warning "Configured merge tool '$N0DOM_CONFLICT_RESOLVER' not found"
+            fi
+        fi
+    fi
+    
+    # If we have a tool, offer to use it
+    if [[ "$use_tool" == "true" ]] && [[ -n "$selected_tool" ]]; then
+        echo "Merge options:"
+        echo "  [m] Open merge tool: $selected_tool"
+        echo "  [r] Use repository version (overwrite home)"
+        echo "  [l] Use local version (update repo)"
+        echo "  [s] Skip this file"
+        echo "  [d] Show diff"
+        read -p "Choose action [m/r/l/s/d]: " -n 1 -r
         echo
         
         case "$REPLY" in
-            y|Y)
-                mv "$temp_file" "$repo_file"
+            m|M)
+                print_info "Opening $selected_tool for merge resolution..."
+                run_merge_tool "$selected_tool" "$home_file" "$temp_file"
+                
+                echo
+                read -p "Use merged version? [y/n/c] (y=repo, n=home, c=cancel): " -n 1 -r
+                echo
+                
+                case "$REPLY" in
+                    y|Y)
+                        mv "$temp_file" "$repo_file"
+                        return 0
+                        ;;
+                    n|N)
+                        rm -f "$temp_file"
+                        return 1
+                        ;;
+                    *)
+                        rm -f "$temp_file"
+                        return 2
+                        ;;
+                esac
+                ;;
+            r|R)
+                rm -f "$temp_file"
                 return 0
                 ;;
-            n|N)
+            l|L)
                 rm -f "$temp_file"
                 return 1
+                ;;
+            s|S)
+                rm -f "$temp_file"
+                return 2
+                ;;
+            d|D)
+                diff -u "$repo_file" "$home_file" || true
+                echo
+                read -p "Choose action [m/r/l/s]: " -n 1 -r
+                echo
+                case "$REPLY" in
+                    m|M)
+                        print_info "Opening $selected_tool for merge resolution..."
+                        run_merge_tool "$selected_tool" "$home_file" "$temp_file"
+                        read -p "Use merged version? [y/n]: " -n 1 -r
+                        echo
+                        case "$REPLY" in
+                            y|Y)
+                                mv "$temp_file" "$repo_file"
+                                return 0
+                                ;;
+                            *)
+                                rm -f "$temp_file"
+                                return 1
+                                ;;
+                        esac
+                        ;;
+                    r|R)
+                        rm -f "$temp_file"
+                        return 0
+                        ;;
+                    l|L)
+                        rm -f "$temp_file"
+                        return 1
+                        ;;
+                    *)
+                        rm -f "$temp_file"
+                        return 2
+                        ;;
+                esac
                 ;;
             *)
                 rm -f "$temp_file"
                 return 2
                 ;;
         esac
-    else
-        echo "Options:"
-        echo "  [r] Use repository version (overwrite home)"
-        echo "  [l] Use local version (update repo)"
-        echo "  [s] Skip this file"
-        echo "  [d] Show diff"
-        read -p "Choose action [r/l/s/d]: " -n 1 -r
-        echo
-        
-        case "$REPLY" in
-            d|D)
-                diff -u "$repo_file" "$home_file" || true
-                read -p "Choose action [r/l/s]: " -n 1 -r
-                echo
-                case "$REPLY" in
-                    r|R) return 0 ;;
-                    l|L) return 1 ;;
-                    *) return 2 ;;
-                esac
-                ;;
-            r|R) return 0 ;;
-            l|L) return 1 ;;
-            *) return 2 ;;
-        esac
     fi
+    
+    # No merge tool available or manual mode - show text menu
+    echo "Options:"
+    echo "  [r] Use repository version (overwrite home)"
+    echo "  [l] Use local version (update repo)"
+    echo "  [s] Skip this file"
+    echo "  [d] Show diff"
+    
+    # Show available tools as option if any
+    if [[ -n "$available_tools" ]]; then
+        echo "  [t] Choose merge tool"
+    fi
+    
+    read -p "Choose action [r/l/s/d$( [[ -n "$available_tools" ]] && echo '/t' )]: " -n 1 -r
+    echo
+    
+    case "$REPLY" in
+        t|T)
+            if [[ -n "$available_tools" ]]; then
+                echo
+                echo "Available merge tools:"
+                local i=1
+                for tool_info in $available_tools; do
+                    local tool_name="${tool_info%%:*}"
+                    local tool_desc="${tool_info#*:}"
+                    echo "  [$i] $tool_desc"
+                    ((i++)) || true
+                done
+                echo "  [0] Cancel"
+                
+                read -p "Select tool [0-$((i-1))]: " -r choice
+                
+                if [[ "$choice" -ge 1 ]] && [[ "$choice" -lt "$i" ]]; then
+                    local tool_array=($available_tools)
+                    selected_tool="${tool_array[$((choice-1))]%%:*}"
+                    
+                    print_info "Opening $selected_tool for merge resolution..."
+                    run_merge_tool "$selected_tool" "$home_file" "$temp_file"
+                    
+                    echo
+                    read -p "Use merged version? [y/n]: " -n 1 -r
+                    echo
+                    
+                    case "$REPLY" in
+                        y|Y)
+                            mv "$temp_file" "$repo_file"
+                            return 0
+                            ;;
+                        *)
+                            rm -f "$temp_file"
+                            return 1
+                            ;;
+                    esac
+                else
+                    rm -f "$temp_file"
+                    return 2
+                fi
+            else
+                rm -f "$temp_file"
+                return 2
+            fi
+            ;;
+        d|D)
+            diff -u "$repo_file" "$home_file" || true
+            read -p "Choose action [r/l/s]: " -n 1 -r
+            echo
+            case "$REPLY" in
+                r|R)
+                    rm -f "$temp_file"
+                    return 0
+                    ;;
+                l|L)
+                    rm -f "$temp_file"
+                    return 1
+                    ;;
+                *)
+                    rm -f "$temp_file"
+                    return 2
+                    ;;
+            esac
+            ;;
+        r|R)
+            rm -f "$temp_file"
+            return 0
+            ;;
+        l|L)
+            rm -f "$temp_file"
+            return 1
+            ;;
+        *)
+            rm -f "$temp_file"
+            return 2
+            ;;
+    esac
 }
 
 perform_two_way_sync() {
@@ -1705,10 +1932,36 @@ run_diagnostics() {
         print_warning "yq: not found (optional, for config file support)"
     fi
     
+    echo
+    echo -e "${BOLD}Checking merge tools...${RESET}"
+    local merge_tools=()
+    
     if command -v meld &> /dev/null; then
         print_success "meld: installed"
+        merge_tools+=("meld")
+    fi
+    if command -v vimdiff &> /dev/null; then
+        print_success "vimdiff: installed"
+        merge_tools+=("vimdiff")
+    fi
+    if command -v code &> /dev/null; then
+        print_success "code (VS Code): installed"
+        merge_tools+=("code")
+    fi
+    if command -v kdiff3 &> /dev/null; then
+        print_success "kdiff3: installed"
+        merge_tools+=("kdiff3")
+    fi
+    if command -v diffuse &> /dev/null; then
+        print_success "diffuse: installed"
+        merge_tools+=("diffuse")
+    fi
+    
+    if [[ ${#merge_tools[@]} -eq 0 ]]; then
+        print_warning "No merge tools found"
+        print_info "Install one: meld, vimdiff, or code"
     else
-        print_warning "meld: not found (optional, for conflict resolution)"
+        echo "  Configured resolver: ${N0DOM_CONFLICT_RESOLVER:-auto}"
     fi
     
     echo

@@ -116,9 +116,15 @@ install_dependencies() {
         missing+=("yq")
     fi
     
+    # meld is optional - ask user
     if ! command -v meld &> /dev/null; then
-        print_info "meld not found, will install (recommended for conflict resolution)"
-        missing+=("meld")
+        print_info "meld is a graphical merge tool for conflict resolution"
+        print_info "Other options: vimdiff (included with vim), code (VS Code)"
+        read -p "Install meld? [Y/n] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            missing+=("meld")
+        fi
     fi
     
     if [[ ${#missing[@]} -gt 0 ]]; then

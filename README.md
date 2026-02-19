@@ -302,7 +302,11 @@ Checking dependencies...
 ✓ git: 2.53.0
 ✓ gh: 2.86.0
 ✓ yq: installed
+
+Checking merge tools...
 ✓ meld: installed
+✓ vimdiff: installed
+  Configured resolver: auto
 
 Checking Git configuration...
 ✗ git user.email: not set
@@ -395,8 +399,33 @@ backup:
 
 sync:
   symlink_mode: true
-  conflict_resolver: "meld"
+  conflict_resolver: "auto"
 ```
+
+### Merge Tool Configuration
+
+The `conflict_resolver` setting controls how conflicts are resolved:
+
+| Value | Behavior |
+|-------|----------|
+| `auto` | Auto-select first available merge tool |
+| `meld` | Use Meld (must be installed) |
+| `vimdiff` | Use Vimdiff (must be installed) |
+| `code` | Use VS Code (must be installed) |
+| `kdiff3` | Use KDiff3 (must be installed) |
+| `none` / `manual` | Always show manual menu |
+
+**Supported merge tools:**
+- **meld** - Visual merge tool (GUI)
+- **vimdiff** - Vim-based diff (CLI)
+- **code** - VS Code (GUI)
+- **kdiff3** - KDE diff tool (GUI)
+- **diffuse** - Graphical diff tool (GUI)
+
+During conflict resolution, you can always:
+- Choose `[m]` to open the merge tool
+- Choose `[t]` to select a different tool
+- Choose `[r/l/s/d]` for manual resolution
 
 ## Ignore Patterns
 
