@@ -233,6 +233,12 @@ export_packages() {
         return 1
     fi
     
+    if [[ ! -d "$N0DOM_REPO_PATH/.git" ]]; then
+        print_error "Repository not initialized"
+        print_info "Run 'n0dom init' to create a repository first"
+        return 1
+    fi
+    
     local package_file="$N0DOM_REPO_PATH/.n0dom-packages"
     
     print_info "Exporting installed packages..."
@@ -241,6 +247,7 @@ export_packages() {
     local count
     count=$(wc -l < "$package_file")
     
+    cd "$N0DOM_REPO_PATH" || return 1
     git add ".n0dom-packages"
     print_success "Exported $count packages to .n0dom-packages"
 }
