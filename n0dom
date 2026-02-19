@@ -1,0 +1,2274 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================
+# N0DOM - Dotfiles Manager for Arch Linux
+# Version: 1.0.0
+# ============================================
+
+readonly N0DOM_VERSION="1.1.0"
+readonly N0DOM_CONFIG_DIR="${HOME}/.config/n0dom"
+readonly N0DOM_DATA_DIR="${HOME}/.local/share/n0dom"
+readonly N0DOM_DEFAULT_REPO="${N0DOM_DATA_DIR}/repo"
+readonly N0DOM_BACKUP_DIR="${N0DOM_DATA_DIR}/backups"
+readonly N0DOM_CONFIG_FILE="${N0DOM_CONFIG_DIR}/config.yaml"
+readonly N0DOM_IGNORE_FILE=".n0domignore"
+readonly N0DOM_LOCK_FILE="${N0DOM_DATA_DIR}/n0dom.lock"
+readonly N0DOM_STATE_FILE="${N0DOM_DATA_DIR}/state.json"
+
+# Colors
+readonly RESET='\033[0m'
+readonly BOLD='\033[1m'
+readonly DIM='\033[2m'
+readonly RED='\033[31m'
+readonly GREEN='\033[32m'
+readonly YELLOW='\033[33m'
+readonly BLUE='\033[34m'
+readonly MAGENTA='\033[35m'
+readonly CYAN='\033[36m'
+
+# Symbols
+readonly CHECK='✓'
+readonly CROSS='✗'
+readonly ARROW='➜'
+readonly INFO='ℹ'
+readonly WARN='⚠'
+readonly LINK='🔗'
+readonly REPO='📦'
+readonly SYNC='🔄'
+
+# ============================================
+# UTILITY FUNCTIONS
+# ============================================
+
+print_success() {
+    echo -e "${GREEN}${CHECK}${RESET} $1"
+}
+
+print_error() {
+    echo -e "${RED}${CROSS}${RESET} $1" >&2
+}
+
+print_info() {
+    echo -e "${BLUE}${ARROW}${RESET} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}${WARN}${RESET} $1"
+}
+
+print_notice() {
+    echo -e "${MAGENTA}${INFO}${RESET} $1"
+}
+
+print_sync() {
+    echo -e "${CYAN}${SYNC}${RESET} $1"
+}
+
+truncate_path() {
+    local path="$1"
+    local max_length="${2:-50}"
+    if ((${#path} > max_length)); then
+        local filename
+        filename=$(basename "$path")
+        local prefix="..."
+        local remaining=$((max_length - ${#prefix} - ${#filename} - 1))
+        if ((remaining > 5)); then
+            echo "${prefix}${path: -remaining}/${filename}"
+        else
+            echo "...${filename}"
+        fi
+    else
+        echo "$path"
+    fi
+}
+
+resolve_path() {
+    local path="$1"
+    if [[ "$path" == /* ]]; then
+        echo "$path"
+    elif [[ "$path" == "~"* ]]; then
+        echo "${path/#\~/$HOME}"
+    else
+        echo "$HOME/$path"
+    fi
+}
+
+confirm_action() {
+    local prompt="$1"
+    local default="${2:-n}"
+    
+    if [[ "${N0DOM_YES_MODE:-false}" == "true" ]]; then
+        return 0
+    fi
+    
+    local options="[y/N]"
+    [[ "$default" == "y" ]] && options="[Y/n]"
+    
+    echo -e "${YELLOW}${WARN}${RESET} $prompt"
+    read -p "Proceed? $options " -n 1 -r
+    echo
+    
+    case "$REPLY" in
+        y|Y) return 0 ;;
+        n|N) return 1 ;;
+        *) 
+            if [[ "$default" == "y" ]]; then
+                return 0
+            else
+                return 1
+            fi
+            ;;
+    esac
+}
+
+safe_remove() {
+    local target="$1"
+    local description="${2:-file}"
+    
+    if [[ ! -e "$target" ]] && [[ ! -L "$target" ]]; then
+        return 0
+    fi
+    
+    local target_type="file"
+    [[ -d "$target" ]] && target_type="directory"
+    [[ -L "$target" ]] && target_type="symlink"
+    
+    print_warning "Removing $target_type: ${target#$HOME/}"
+    rm -rf "$target"
+    return $?
+}
+
+validate_path() {
+    local path="$1"
+    local must_exist="${2:-true}"
+    
+    local abs_path
+    abs_path=$(resolve_path "$path")
+    
+    if [[ "$must_exist" == "true" ]]; then
+        if [[ ! -e "$abs_path" ]]; then
+            print_error "Path does not exist: $path"
+            return 1
+        fi
+        
+        if [[ ! -r "$abs_path" ]]; then
+            print_error "Path is not readable: $path"
+            return 1
+        fi
+    fi
+    
+    if [[ "$abs_path" != "$HOME"* ]]; then
+        print_error "Path must be within home directory: $path"
+        return 1
+    fi
+    
+    echo "$abs_path"
+    return 0
+}
+
+check_for_secrets() {
+    local file="$1"
+    local basename
+    basename=$(basename "$file")
+    
+    local secret_patterns=(
+        "*.pem"
+        "*.key"
+        "*_key"
+        "*id_rsa*"
+        "*id_ed25519*"
+        "*credentials*"
+        "*secret*"
+        "*.p12"
+        "*.pfx"
+        ".env*"
+        "*.token"
+    )
+    
+    for pattern in "${secret_patterns[@]}"; do
+        case "$basename" in
+            $pattern)
+                print_warning "Potentially sensitive file detected: $basename"
+                if ! confirm_action "This file may contain secrets. Track anyway?" "n"; then
+                    return 1
+                fi
+                break
+                ;;
+        esac
+    done
+    
+    return 0
+}
+
+resolve_machine_file() {
+    local file="$1"
+    local prefer_machine="${2:-true}"
+    
+    if [[ "$prefer_machine" != "true" ]]; then
+        echo "$file"
+        return 0
+    fi
+    
+    local hostname
+    hostname=$(hostname 2>/dev/null | cut -d. -f1)
+    
+    if [[ -z "$hostname" ]]; then
+        echo "$file"
+        return 0
+    fi
+    
+    local machine_file="${file}.${hostname}"
+    
+    if [[ -f "$machine_file" ]]; then
+        echo "$machine_file"
+    else
+        echo "$file"
+    fi
+}
+
+export_packages() {
+    if ! command -v pacman &> /dev/null; then
+        print_warning "pacman not found, skipping package export"
+        return 1
+    fi
+    
+    local package_file="$N0DOM_REPO_PATH/.n0dom-packages"
+    
+    print_info "Exporting installed packages..."
+    pacman -Qqe > "$package_file"
+    
+    local count
+    count=$(wc -l < "$package_file")
+    
+    git add ".n0dom-packages"
+    print_success "Exported $count packages to .n0dom-packages"
+}
+
+import_packages() {
+    local package_file="$N0DOM_REPO_PATH/.n0dom-packages"
+    
+    if [[ ! -f "$package_file" ]]; then
+        print_warning "No .n0dom-packages file found"
+        return 1
+    fi
+    
+    if ! command -v pacman &> /dev/null; then
+        print_warning "pacman not found, skipping package import"
+        return 1
+    fi
+    
+    local count
+    count=$(wc -l < "$package_file")
+    
+    print_info "Found $count packages in .n0dom-packages"
+    
+    if ! confirm_action "Install missing packages?" "n"; then
+        print_info "Package import cancelled"
+        return 0
+    fi
+    
+    print_info "Installing packages..."
+    sudo pacman -S --needed - < "$package_file"
+    
+    print_success "Package import completed"
+}
+
+acquire_lock() {
+    local timeout="${1:-30}"
+    local waited=0
+    
+    mkdir -p "$(dirname "$N0DOM_LOCK_FILE")"
+    
+    while [[ -f "$N0DOM_LOCK_FILE" ]]; do
+        local lock_pid
+        lock_pid=$(cat "$N0DOM_LOCK_FILE" 2>/dev/null || echo "")
+        
+        if [[ -n "$lock_pid" ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+            rm -f "$N0DOM_LOCK_FILE"
+            break
+        fi
+        
+        if ((waited >= timeout)); then
+            print_error "Could not acquire lock after ${timeout}s"
+            print_info "Another n0dom process may be running (PID: $lock_pid)"
+            return 1
+        fi
+        
+        sleep 1
+        ((waited++))
+    done
+    
+    echo $$ > "$N0DOM_LOCK_FILE"
+    return 0
+}
+
+release_lock() {
+    rm -f "$N0DOM_LOCK_FILE"
+}
+
+check_disk_space() {
+    local required_mb="${1:-100}"
+    local target_dir="${2:-$N0DOM_BACKUP_DIR}"
+    
+    local available_kb
+    available_kb=$(df -k "$(dirname "$target_dir")" 2>/dev/null | awk 'NR==2 {print $4}')
+    
+    if [[ -z "$available_kb" ]]; then
+        print_warning "Could not check disk space"
+        return 0
+    fi
+    
+    local available_mb=$((available_kb / 1024))
+    
+    if ((available_mb < required_mb)); then
+        print_warning "Low disk space: ${available_mb}MB available, ${required_mb}MB recommended"
+        if ! confirm_action "Continue with low disk space?" "n"; then
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
+# ============================================
+# DEPENDENCY CHECKS
+# ============================================
+
+check_dependencies() {
+    local missing=()
+    
+    if ! command -v git &> /dev/null; then
+        missing+=("git")
+    fi
+    
+    if ! command -v gh &> /dev/null; then
+        missing+=("github-cli (gh)")
+    fi
+    
+    if ! command -v yq &> /dev/null; then
+        print_warning "yq not found. Configuration file support limited."
+        print_info "Install with: sudo pacman -S yq"
+    fi
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        print_error "Missing required dependencies: ${missing[*]}"
+        print_info "Install with: sudo pacman -S ${missing[*]//github-cli (gh)/gh}"
+        exit 2
+    fi
+}
+
+ensure_gh_auth() {
+    if ! gh auth status &> /dev/null; then
+        print_info "GitHub authentication required"
+        print_info "Opening browser for authentication..."
+        gh auth login --web || {
+            print_error "GitHub authentication failed"
+            exit 3
+        }
+        print_success "Authenticated with GitHub"
+    fi
+}
+
+# ============================================
+# CONFIGURATION MANAGEMENT
+# ============================================
+
+get_config_value() {
+    local key="$1"
+    local default="${2:-}"
+    
+    if [[ ! -f "$N0DOM_CONFIG_FILE" ]]; then
+        echo "$default"
+        return
+    fi
+    
+    local value=""
+    if command -v yq &> /dev/null; then
+        value=$(yq ".$key" "$N0DOM_CONFIG_FILE" 2>/dev/null | tr -d '"')
+        if [[ "$value" == "null" ]] || [[ -z "$value" ]]; then
+            value=""
+        fi
+    fi
+    
+    if [[ -z "$value" ]]; then
+        local key_name
+        key_name=$(echo "$key" | sed 's/\./_/g; s/repo_/repo./; s/backup_/backup./; s/sync_/sync./')
+        value=$(grep -E "^\s*${key##*.}:" "$N0DOM_CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*:\s*//' | tr -d '"')
+    fi
+    
+    echo "${value:-$default}"
+}
+
+load_config() {
+    N0DOM_REPO_URL=$(get_config_value "repo.url" "")
+    N0DOM_REPO_BRANCH=$(get_config_value "repo.branch" "main")
+    N0DOM_REPO_PATH=$(get_config_value "repo.local_path" "$N0DOM_DEFAULT_REPO")
+    N0DOM_BACKUP_RETENTION=$(get_config_value "backup.retention_days" "30")
+    N0DOM_MAX_BACKUPS=$(get_config_value "backup.max_backups" "50")
+    N0DOM_AUTO_COMMIT=$(get_config_value "sync.auto_commit" "false")
+}
+
+save_config() {
+    local repo_url="${1:-}"
+    local repo_branch="${2:-main}"
+    local repo_path="${3:-$N0DOM_DEFAULT_REPO}"
+    
+    mkdir -p "$N0DOM_CONFIG_DIR"
+    
+    cat > "$N0DOM_CONFIG_FILE" << EOF
+version: "${N0DOM_VERSION}"
+
+repo:
+  url: "${repo_url}"
+  branch: "${repo_branch}"
+  local_path: "${repo_path}"
+
+backup:
+  retention_days: ${N0DOM_BACKUP_RETENTION:-30}
+  max_backups: ${N0DOM_MAX_BACKUPS:-50}
+  auto_backup: true
+
+sync:
+  symlink_mode: true
+  conflict_resolver: "meld"
+  auto_commit: false
+EOF
+    
+    print_success "Configuration saved to ${N0DOM_CONFIG_FILE}"
+}
+
+# ============================================
+# BACKUP SYSTEM
+# ============================================
+
+create_backup() {
+    local backup_name="${1:-manual}"
+    local timestamp
+    timestamp=$(date +"%Y%m%d_%H%M%S")
+    local backup_dir="${N0DOM_BACKUP_DIR}/${timestamp}_${backup_name}"
+    
+    mkdir -p "$backup_dir"
+    print_info "Creating backup: ${backup_dir#$HOME/}"
+    
+    if [[ -d "$N0DOM_REPO_PATH" ]]; then
+        cd "$N0DOM_REPO_PATH" || return 1
+        while IFS= read -r -d '' file; do
+            local home_file="$HOME/$file"
+            if [[ -e "$home_file" ]]; then
+                local backup_file="${backup_dir}/${file}"
+                mkdir -p "$(dirname "$backup_file")"
+                cp -rL "$home_file" "$backup_file" 2>/dev/null || true
+            fi
+        done < <(git ls-files -z 2>/dev/null || true)
+    fi
+    
+    cleanup_old_backups
+    echo "$backup_dir"
+}
+
+list_backups() {
+    if [[ ! -d "$N0DOM_BACKUP_DIR" ]]; then
+        print_warning "No backups found"
+        return 1
+    fi
+    
+    print_info "Available backups:"
+    local backups=()
+    while IFS= read -r -d '' backup; do
+        backups+=("$backup")
+    done < <(find "$N0DOM_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | sort -z -r)
+    
+    if [[ ${#backups[@]} -eq 0 ]]; then
+        print_warning "No backups found"
+        return 1
+    fi
+    
+    printf "\n%-30s %-20s %s\n" "BACKUP ID" "DATE" "TYPE"
+    printf "%-30s %-20s %s\n" "$(printf '%.0s-' {1..30})" "$(printf '%.0s-' {1..20})" "$(printf '%.0s-' {1..15})"
+    
+    for backup in "${backups[@]}"; do
+        local basename
+        basename=$(basename "$backup")
+        local date_part="${basename:0:8}"
+        local time_part="${basename:9:6}"
+        local type="${basename:16}"
+        local formatted_date="${date_part:0:4}-${date_part:4:2}-${date_part:6:2} ${time_part:0:2}:${time_part:2:2}"
+        printf "%-30s %-20s %s\n" "$basename" "$formatted_date" "$type"
+    done
+    echo
+}
+
+restore_backup() {
+    local backup_id="$1"
+    
+    if [[ -z "$backup_id" ]]; then
+        print_error "No backup ID specified"
+        list_backups
+        return 1
+    fi
+    
+    local backup_dir="${N0DOM_BACKUP_DIR}/${backup_id}"
+    
+    if [[ ! -d "$backup_dir" ]]; then
+        print_error "Backup not found: $backup_id"
+        list_backups
+        return 1
+    fi
+    
+    print_warning "This will overwrite current dotfiles"
+    if ! confirm_action "Restore from backup: $backup_id?" "n"; then
+        print_info "Restore cancelled"
+        return 0
+    fi
+    
+    print_info "Creating safety backup before restore..."
+    create_backup "pre-restore"
+    
+    print_info "Restoring from backup: $backup_id"
+    
+    find "$backup_dir" -type f | while read -r file; do
+        local rel_path="${file#$backup_dir/}"
+        local target="$HOME/$rel_path"
+        
+        if [[ -L "$target" ]]; then
+            safe_remove "$target" "symlink"
+        fi
+        
+        mkdir -p "$(dirname "$target")"
+        cp -r "$file" "$target"
+        print_success "Restored: $rel_path"
+    done
+    
+    print_success "Restore completed!"
+    print_warning "Run 'n0dom sync' to re-establish symlinks"
+}
+
+cleanup_old_backups() {
+    if [[ ! -d "$N0DOM_BACKUP_DIR" ]]; then
+        return 0
+    fi
+    
+    local retention_seconds=$((N0DOM_BACKUP_RETENTION * 86400))
+    local current_time
+    current_time=$(date +%s)
+    local cleaned_count=0
+    local total_count=0
+    local max_backups="${N0DOM_MAX_BACKUPS:-50}"
+    
+    while IFS= read -r -d '' backup; do
+        ((total_count++))
+        local backup_time
+        backup_time=$(stat -c %Y "$backup" 2>/dev/null || stat -f %m "$backup" 2>/dev/null)
+        local age=$((current_time - backup_time))
+        
+        local should_remove=false
+        
+        if ((age > retention_seconds)); then
+            should_remove=true
+        fi
+        
+        if ((total_count > max_backups)); then
+            should_remove=true
+        fi
+        
+        if [[ "$should_remove" == "true" ]]; then
+            rm -rf "$backup"
+            print_notice "Cleaned up old backup: $(basename "$backup")"
+            ((cleaned_count++))
+        fi
+    done < <(find "$N0DOM_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | sort -z)
+    
+    if [[ $cleaned_count -gt 0 ]]; then
+        echo
+        print_info "Backup cleanup: removed $cleaned_count old backup(s), $((total_count - cleaned_count)) remaining"
+    fi
+}
+
+# ============================================
+# REPOSITORY OPERATIONS
+# ============================================
+
+create_n0domignore() {
+    local repo_path="$1"
+    local ignore_file="${repo_path}/${N0DOM_IGNORE_FILE}"
+    
+    if [[ ! -f "$ignore_file" ]]; then
+        cat > "$ignore_file" << 'EOF'
+# N0DOM Ignore Patterns
+# Files and directories listed here won't be synced to your home directory
+
+# Git
+.git/
+.gitignore
+
+# N0DOM
+.n0domignore
+.n0dom-packages
+
+# Documentation
+README.md
+LICENSE
+CHANGELOG.md
+
+# Temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# Cache directories
+.cache/
+__pycache__/
+*.pyc
+EOF
+        print_success "Created ${N0DOM_IGNORE_FILE}"
+    fi
+}
+
+init_repo() {
+    print_info "Initializing n0dom repository..."
+    local reinitializing=false
+    
+    if [[ -d "$N0DOM_REPO_PATH/.git" ]]; then
+        print_warning "Repository already exists at $N0DOM_REPO_PATH"
+        if confirm_action "Reinitialize repository?" "n"; then
+            reinitializing=true
+        else
+            return 0
+        fi
+    fi
+    
+    print_info "Enter your GitHub repository (format: username/repo):"
+    read -r repo_input
+    
+    if [[ ! "$repo_input" =~ ^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+$ ]]; then
+        print_error "Invalid repository format. Use: username/repo"
+        exit 4
+    fi
+    
+    local repo_url="https://github.com/${repo_input}.git"
+    
+    if ! gh repo view "$repo_input" &> /dev/null; then
+        print_info "Repository doesn't exist."
+        local visibility="--public"
+        if confirm_action "Make it private?" "n"; then
+            visibility="--private"
+        fi
+        
+        print_info "Creating GitHub repository..."
+        gh repo create "$repo_input" $visibility --description "Dotfiles managed by n0dom" || {
+            print_error "Failed to create repository"
+            exit 4
+        }
+        print_success "Repository created: ${repo_url}"
+    fi
+    
+    mkdir -p "$N0DOM_REPO_PATH"
+    cd "$N0DOM_REPO_PATH"
+    
+    # Initialize git repo (only if not reinitializing)
+    if [[ "$reinitializing" == "false" ]]; then
+        git init --initial-branch=main
+    fi
+    
+    # Set or update remote origin
+    if git remote get-url origin &> /dev/null; then
+        git remote set-url origin "$repo_url"
+        print_info "Updated remote origin"
+    else
+        git remote add origin "$repo_url"
+    fi
+    
+    # Check if git user is configured (locally or globally)
+    if ! git config user.email &> /dev/null || ! git config user.name &> /dev/null; then
+        print_warning "Git user identity not configured"
+        
+        # Try to get GitHub user info from gh CLI
+        local gh_user=""
+        
+        if command -v gh &> /dev/null && gh auth status &> /dev/null; then
+            gh_user=$(gh api user -q '.login' 2>/dev/null || echo "")
+        fi
+        
+        if [[ -n "$gh_user" ]]; then
+            local gh_email="${gh_user}@users.noreply.github.com"
+            print_info "Using GitHub username: $gh_user"
+            git config user.name "$gh_user"
+            git config user.email "$gh_email"
+            print_success "Git identity configured for this repository"
+        else
+            print_error "Git user identity required"
+            print_info "Please configure git:"
+            print_info "  git config --global user.email 'you@example.com'"
+            print_info "  git config --global user.name 'Your Name'"
+            exit 1
+        fi
+    fi
+    
+    create_n0domignore "$N0DOM_REPO_PATH"
+    git add "$N0DOM_IGNORE_FILE"
+    
+    # Create initial commit (only if not reinitializing or no commits exist)
+    if [[ "$reinitializing" == "false" ]] || ! git rev-parse --verify HEAD &> /dev/null; then
+        git commit -m "Initial commit: Add .n0domignore"
+    fi
+    
+    save_config "$repo_url" "main" "$N0DOM_REPO_PATH"
+    
+    if [[ "$reinitializing" == "true" ]]; then
+        print_success "Repository reinitialized!"
+    else
+        print_success "Repository initialized!"
+    fi
+    print_info "Default branch: main"
+    print_info "Next steps:"
+    print_info "  1. Add files with: n0dom track <path>"
+    print_info "  2. Sync with: n0dom sync"
+}
+
+clone_repo() {
+    local repo_input="$1"
+    
+    if [[ -z "$repo_input" ]]; then
+        print_error "No repository specified"
+        print_info "Usage: n0dom clone username/repo"
+        exit 4
+    fi
+    
+    local repo_url
+    if [[ "$repo_input" =~ ^https?:// ]]; then
+        repo_url="$repo_input"
+    elif [[ "$repo_input" =~ ^git@ ]]; then
+        repo_url="$repo_input"
+    else
+        repo_url="https://github.com/${repo_input}.git"
+    fi
+    
+    print_info "Cloning repository: $repo_url"
+    
+    if [[ -d "$N0DOM_REPO_PATH" ]]; then
+        print_warning "Repository directory already exists"
+        if confirm_action "Remove existing and clone fresh?" "n"; then
+            create_backup "pre-clone"
+            safe_remove "$N0DOM_REPO_PATH" "repository directory"
+        else
+            print_error "Clone cancelled"
+            exit 4
+        fi
+    fi
+    
+    mkdir -p "$(dirname "$N0DOM_REPO_PATH")"
+    git clone "$repo_url" "$N0DOM_REPO_PATH" || {
+        print_error "Failed to clone repository"
+        exit 4
+    }
+    
+    cd "$N0DOM_REPO_PATH"
+    local default_branch
+    default_branch=$(git rev-parse --abbrev-ref HEAD)
+    
+    save_config "$repo_url" "$default_branch" "$N0DOM_REPO_PATH"
+    
+    print_success "Repository cloned to ${N0DOM_REPO_PATH#$HOME/}"
+    print_info "Run 'n0dom sync' to activate dotfiles"
+}
+
+# ============================================
+# TWO-WAY SYNC OPERATIONS
+# ============================================
+
+get_file_hash() {
+    local file="$1"
+    if [[ -f "$file" ]]; then
+        md5sum "$file" 2>/dev/null | cut -d' ' -f1 || echo ""
+    else
+        echo ""
+    fi
+}
+
+detect_home_changes() {
+    local changes=()
+    cd "$N0DOM_REPO_PATH"
+    
+    while IFS= read -r -d '' file; do
+        local home_file="$HOME/$file"
+        local repo_file="$N0DOM_REPO_PATH/$file"
+        
+        # Skip if home file doesn't exist
+        [[ ! -e "$home_file" ]] && continue
+        
+        # Skip if home file is already correctly symlinked
+        if [[ -L "$home_file" ]]; then
+            local target
+            target=$(readlink "$home_file")
+            [[ "$target" == "$repo_file" ]] && continue
+        fi
+        
+        # Compare content
+        if [[ -f "$home_file" && -f "$repo_file" ]]; then
+            if ! diff -q "$home_file" "$repo_file" &> /dev/null; then
+                changes+=("$file")
+            fi
+        elif [[ -d "$home_file" && -d "$repo_file" ]]; then
+            # Directory exists but might have changes - check recursively
+            if ! diff -rq "$home_file" "$repo_file" &> /dev/null; then
+                changes+=("$file")
+            fi
+        fi
+    done < <(git ls-files -z)
+    
+    printf '%s\n' "${changes[@]}"
+}
+
+sync_home_to_repo() {
+    local file="$1"
+    local home_file="$HOME/$file"
+    local repo_file="$N0DOM_REPO_PATH/$file"
+    
+    if [[ ! -e "$home_file" ]]; then
+        return 1
+    fi
+    
+    # Skip if already correctly symlinked
+    if [[ -L "$home_file" ]]; then
+        local target
+        target=$(readlink "$home_file")
+        [[ "$target" == "$repo_file" ]] && return 1
+    fi
+    
+    # Check if files are identical
+    if [[ -f "$home_file" && -f "$repo_file" ]]; then
+        if diff -q "$home_file" "$repo_file" &> /dev/null; then
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
+sync_repo_to_home() {
+    local file="$1"
+    local repo_file="$N0DOM_REPO_PATH/$file"
+    local home_file="$HOME/$file"
+    
+    if [[ ! -e "$repo_file" ]]; then
+        return 1
+    fi
+    
+    # Check if already correctly symlinked
+    if [[ -L "$home_file" ]]; then
+        local target
+        target=$(readlink "$home_file")
+        [[ "$target" == "$repo_file" ]] && return 1
+    fi
+    
+    return 0
+}
+
+resolve_two_way_conflict() {
+    local file="$1"
+    local repo_file="$N0DOM_REPO_PATH/$file"
+    local home_file="$HOME/$file"
+    
+    print_warning "Conflict detected: $file"
+    print_info "Both home and repo versions have changed"
+    
+    if command -v meld &> /dev/null; then
+        print_info "Opening meld for merge resolution..."
+        local temp_file
+        temp_file=$(mktemp)
+        cp "$repo_file" "$temp_file"
+        meld "$home_file" "$temp_file"
+        
+        echo
+        read -p "Use merged version? [y=repo, n=home, c=cancel]: " -n 1 -r
+        echo
+        
+        case "$REPLY" in
+            y|Y)
+                mv "$temp_file" "$repo_file"
+                return 0
+                ;;
+            n|N)
+                rm -f "$temp_file"
+                return 1
+                ;;
+            *)
+                rm -f "$temp_file"
+                return 2
+                ;;
+        esac
+    else
+        echo "Options:"
+        echo "  [r] Use repository version (overwrite home)"
+        echo "  [l] Use local version (update repo)"
+        echo "  [s] Skip this file"
+        echo "  [d] Show diff"
+        read -p "Choose action [r/l/s/d]: " -n 1 -r
+        echo
+        
+        case "$REPLY" in
+            d|D)
+                diff -u "$repo_file" "$home_file" || true
+                read -p "Choose action [r/l/s]: " -n 1 -r
+                echo
+                case "$REPLY" in
+                    r|R) return 0 ;;
+                    l|L) return 1 ;;
+                    *) return 2 ;;
+                esac
+                ;;
+            r|R) return 0 ;;
+            l|L) return 1 ;;
+            *) return 2 ;;
+        esac
+    fi
+}
+
+perform_two_way_sync() {
+    local no_backup="${1:-false}"
+    local dry_run="${2:-false}"
+    local verbose="${3:-false}"
+    local message="${4:-"Sync: Update dotfiles"}"
+    
+    if [[ ! -d "$N0DOM_REPO_PATH/.git" ]]; then
+        print_error "Repository not initialized. Run 'n0dom init' or 'n0dom clone' first"
+        exit 5
+    fi
+    
+    if ! acquire_lock 30; then
+        exit 5
+    fi
+    
+    N0DOM_SYNC_BACKUP_ID=""
+    N0DOM_SYNC_ROLLBACK="false"
+    
+    cleanup() {
+        release_lock
+        if [[ "${N0DOM_SYNC_ROLLBACK:-false}" == "true" ]] && [[ -n "${N0DOM_SYNC_BACKUP_ID:-}" ]]; then
+            print_warning "Rolling back due to error..."
+            restore_backup "$N0DOM_SYNC_BACKUP_ID"
+        fi
+    }
+    trap cleanup EXIT
+    
+    cd "$N0DOM_REPO_PATH" || exit 5
+    
+    if git remote get-url origin &> /dev/null; then
+        if git rev-parse --verify HEAD &> /dev/null; then
+            print_info "Fetching changes from remote..."
+            local current_branch
+            current_branch=$(git branch --show-current)
+            if git ls-remote --heads origin "$current_branch" | grep -q "$current_branch"; then
+                if ! git pull --ff-only origin "$current_branch" 2>/dev/null; then
+                    print_warning "Could not fast-forward pull. There may be remote changes."
+                    print_info "Attempting standard pull..."
+                    if ! git pull origin "$current_branch"; then
+                        print_error "Failed to pull from remote. Resolve conflicts manually."
+                        N0DOM_SYNC_ROLLBACK="true"
+                        exit 5
+                    fi
+                fi
+                print_success "Pulled latest changes from remote"
+            else
+                print_info "Remote branch doesn't exist yet (new repository)"
+            fi
+        else
+            print_info "No commits yet, skipping pull"
+        fi
+    fi
+    
+    if [[ "$no_backup" != "true" && "$dry_run" != "true" ]]; then
+        check_disk_space 100 "$N0DOM_BACKUP_DIR" || exit 5
+        local backup_dir
+        backup_dir=$(create_backup "pre-sync")
+        N0DOM_SYNC_BACKUP_ID=$(basename "$backup_dir")
+    fi
+    
+    print_info "Analyzing changes..."
+    
+    # Categorize files
+    local repo_only=()
+    local home_only=()
+    local repo_newer=()
+    local home_newer=()
+    local in_sync=()
+    local conflicts=()
+    
+    while IFS= read -r -d '' file; do
+        [[ -z "$file" ]] && continue
+        
+        local repo_file="$N0DOM_REPO_PATH/$file"
+        local home_file="$HOME/$file"
+        
+        # Skip ignored
+        if is_ignored "$file"; then
+            [[ "$verbose" == "true" ]] && print_notice "Ignored: $file"
+            continue
+        fi
+        
+        # Check if already correctly symlinked
+        if [[ -L "$home_file" ]]; then
+            local target
+            target=$(readlink "$home_file")
+            if [[ "$target" == "$repo_file" ]]; then
+                in_sync+=("$file")
+                continue
+            fi
+        fi
+        
+        # Categorize
+        if [[ ! -e "$home_file" && -e "$repo_file" ]]; then
+            repo_only+=("$file")
+        elif [[ -e "$home_file" && ! -e "$repo_file" ]]; then
+            home_only+=("$file")
+        elif [[ -f "$home_file" && -f "$repo_file" ]]; then
+            if diff -q "$home_file" "$repo_file" &> /dev/null; then
+                # Files are identical but not symlinked - treat as needing symlink
+                repo_only+=("$file")
+            else
+                # Both exist and differ
+                conflicts+=("$file")
+            fi
+        elif [[ -d "$home_file" && -d "$repo_file" ]]; then
+            if diff -rq "$home_file" "$repo_file" &> /dev/null; then
+                # Directories are identical but not symlinked - treat as needing symlink
+                repo_only+=("$file")
+            else
+                conflicts+=("$file")
+            fi
+        fi
+    done < <(git ls-files -z)
+    
+    show_sync_summary() {
+        echo
+        print_info "Sync Summary:"
+        echo -e "  ${GREEN}In sync:${RESET} ${#in_sync[@]} files"
+        echo -e "  ${BLUE}Repo only:${RESET} ${#repo_only[@]} files (will link to home)"
+        echo -e "  ${YELLOW}Home only:${RESET} ${#home_only[@]} files (will copy to repo)"
+        echo -e "  ${RED}Conflicts:${RESET} ${#conflicts[@]} files (need resolution)"
+        
+        if [[ "$dry_run" == "true" ]]; then
+            echo
+            if [[ ${#repo_only[@]} -gt 0 ]]; then
+                echo -e "${BOLD}Files to link (repo -> home):${RESET}"
+                for f in "${repo_only[@]:0:10}"; do
+                    echo -e "  ${GREEN}LINK${RESET} ~/$f"
+                done
+                ((${#repo_only[@]} > 10)) && echo "  ... and $((${#repo_only[@]} - 10)) more"
+            fi
+            
+            if [[ ${#home_only[@]} -gt 0 ]]; then
+                echo
+                echo -e "${BOLD}Files to track (home -> repo):${RESET}"
+                for f in "${home_only[@]:0:10}"; do
+                    echo -e "  ${YELLOW}TRACK${RESET} ~/$f"
+                done
+                ((${#home_only[@]} > 10)) && echo "  ... and $((${#home_only[@]} - 10)) more"
+            fi
+            
+            if [[ ${#conflicts[@]} -gt 0 ]]; then
+                echo
+                echo -e "${BOLD}Files with conflicts:${RESET}"
+                for f in "${conflicts[@]:0:10}"; do
+                    echo -e "  ${RED}CONFLICT${RESET} ~/$f"
+                done
+                ((${#conflicts[@]} > 10)) && echo "  ... and $((${#conflicts[@]} - 10)) more"
+            fi
+        fi
+        echo
+    }
+    
+    show_sync_summary
+    
+    if [[ "$dry_run" == "true" ]]; then
+        print_info "Dry run - no changes made"
+        trap - EXIT
+        release_lock
+        return 0
+    fi
+    
+    if [[ ${#repo_only[@]} -gt 0 ]] || [[ ${#home_only[@]} -gt 0 ]] || [[ ${#conflicts[@]} -gt 0 ]]; then
+        if [[ "$N0DOM_YES_MODE" != "true" ]]; then
+            if ! confirm_action "Proceed with sync?" "n"; then
+                print_info "Sync cancelled"
+                trap - EXIT
+                release_lock
+                return 0
+            fi
+        fi
+    fi
+    
+    for file in "${repo_only[@]}"; do
+        local repo_file="$N0DOM_REPO_PATH/$file"
+        local home_file="$HOME/$file"
+        
+        safe_remove "$home_file" "existing file"
+        
+        mkdir -p "$(dirname "$home_file")"
+        ln -s "$repo_file" "$home_file"
+        print_success "Linked: $file"
+    done
+    
+    for file in "${home_only[@]}"; do
+        local home_file="$HOME/$file"
+        local repo_file="$N0DOM_REPO_PATH/$file"
+        
+        mkdir -p "$(dirname "$repo_file")"
+        cp -r "$home_file" "$repo_file"
+        git add "$file"
+        
+        safe_remove "$home_file" "original file"
+        ln -s "$repo_file" "$home_file"
+        print_success "Tracked & linked: $file"
+    done
+    
+    local conflicts_resolved=0
+    for file in "${conflicts[@]}"; do
+        local repo_file="$N0DOM_REPO_PATH/$file"
+        local home_file="$HOME/$file"
+        
+        resolve_two_way_conflict "$file"
+        local result=$?
+        
+        case $result in
+            0)
+                safe_remove "$home_file" "conflicting file"
+                mkdir -p "$(dirname "$home_file")"
+                ln -s "$repo_file" "$home_file"
+                print_success "Resolved (repo): $file"
+                ((conflicts_resolved++))
+                ;;
+            1)
+                cp -r "$home_file" "$repo_file"
+                git add "$file"
+                safe_remove "$home_file" "original file"
+                ln -s "$repo_file" "$home_file"
+                print_success "Resolved (home): $file"
+                ((conflicts_resolved++))
+                ;;
+            *)
+                print_warning "Skipped: $file"
+                ;;
+        esac
+    done
+    
+    if [[ ${#home_only[@]} -gt 0 || $conflicts_resolved -gt 0 ]] || git diff --quiet --cached 2>/dev/null || [[ -n $(git status --porcelain 2>/dev/null) ]]; then
+        print_info "Committing changes..."
+        git add -A
+        git commit -m "$message" || print_warning "Nothing to commit"
+        
+        if git remote get-url origin &> /dev/null; then
+            print_info "Pushing to remote..."
+            local push_branch
+            push_branch=$(git branch --show-current)
+            if git push origin "$push_branch"; then
+                print_success "Changes pushed to remote"
+            else
+                print_error "Failed to push to remote"
+                N0DOM_SYNC_ROLLBACK="true"
+                exit 5
+            fi
+        fi
+    else
+        print_info "No changes to commit"
+    fi
+    
+    echo
+    cleanup_old_backups
+    
+    echo
+    print_success "Two-way sync complete!"
+    echo "  In sync: ${#in_sync[@]}"
+    echo "  Newly linked: ${#repo_only[@]}"
+    echo "  Newly tracked: ${#home_only[@]}"
+    echo "  Conflicts resolved: $conflicts_resolved"
+    
+    trap - EXIT
+    release_lock
+}
+
+# ============================================
+# FILE OPERATIONS
+# ============================================
+
+is_ignored() {
+    local file="$1"
+    local repo_root="${2:-$N0DOM_REPO_PATH}"
+    local ignore_file="${repo_root}/${N0DOM_IGNORE_FILE}"
+    
+    [[ ! -f "$ignore_file" ]] && return 1
+    
+    while IFS= read -r pattern; do
+        [[ -z "$pattern" || "$pattern" == \#* ]] && continue
+        
+        if [[ "$file" == $pattern || "$file" == */$pattern || "$file" == $pattern/* ]]; then
+            return 0
+        fi
+        
+        if [[ "$pattern" == *\** ]]; then
+            local regex="${pattern//./\.}"
+            regex="${regex//\*/.*}"
+            regex="${regex//\?/.}"
+            if [[ "$file" =~ ^${regex}$ || "$file" =~ /${regex}$ ]]; then
+                return 0
+            fi
+        fi
+    done < "$ignore_file"
+    
+    return 1
+}
+
+track_file() {
+    local file_path="$1"
+    
+    if [[ -z "$file_path" ]]; then
+        print_error "No file specified"
+        print_info "Usage: n0dom track <path>"
+        exit 5
+    fi
+    
+    if [[ ! -d "$N0DOM_REPO_PATH/.git" ]]; then
+        print_error "Repository not initialized"
+        print_info "Run 'n0dom init' to create a new repository"
+        print_info "Run 'n0dom clone <repo>' to restore from existing"
+        exit 5
+    fi
+    
+    local abs_path
+    if ! abs_path=$(validate_path "$file_path" "true"); then
+        exit 5
+    fi
+    
+    check_for_secrets "$abs_path" || exit 5
+    
+    local rel_path="${abs_path#$HOME/}"
+    if [[ "$rel_path" == "$abs_path" ]]; then
+        print_error "File must be in your home directory"
+        exit 5
+    fi
+    
+    cd "$N0DOM_REPO_PATH" || exit 5
+    if git ls-files "$rel_path" | grep -q "^${rel_path}$"; then
+        print_warning "Already tracking: $rel_path"
+        return 0
+    fi
+    
+    local repo_file="${N0DOM_REPO_PATH}/${rel_path}"
+    mkdir -p "$(dirname "$repo_file")"
+    
+    if [[ -d "$abs_path" ]]; then
+        cp -r "$abs_path" "$repo_file"
+    else
+        cp "$abs_path" "$repo_file"
+    fi
+    
+    git add "$rel_path"
+    
+    print_success "Now tracking: $rel_path"
+    print_info "Run 'n0dom sync' to create symlinks and upload to GitHub"
+}
+
+untrack_file() {
+    local file_path="$1"
+    
+    if [[ -z "$file_path" ]]; then
+        print_error "No file specified"
+        print_info "Usage: n0dom untrack <path>"
+        exit 5
+    fi
+    
+    if [[ ! -d "$N0DOM_REPO_PATH/.git" ]]; then
+        print_error "Repository not initialized"
+        print_info "Run 'n0dom init' to create a new repository"
+        print_info "Run 'n0dom clone <repo>' to restore from existing"
+        exit 5
+    fi
+    
+    local rel_path="${file_path#$HOME/}"
+    
+    cd "$N0DOM_REPO_PATH" || exit 5
+    
+    local tracked_files
+    tracked_files=$(git ls-files "$rel_path")
+    if [[ -z "$tracked_files" ]]; then
+        print_warning "Not currently tracking: $rel_path"
+        return 0
+    fi
+    
+    if ! confirm_action "Untrack $rel_path and restore to home directory?" "n"; then
+        print_info "Untrack cancelled"
+        return 0
+    fi
+    
+    while IFS= read -r tracked_file; do
+        [[ -z "$tracked_file" ]] && continue
+        
+        local home_file="$HOME/$tracked_file"
+        local repo_file="$N0DOM_REPO_PATH/$tracked_file"
+        
+        if [[ -L "$home_file" ]]; then
+            safe_remove "$home_file" "symlink"
+            mkdir -p "$(dirname "$home_file")"
+            cp -r "$repo_file" "$home_file"
+            print_notice "Restored: $tracked_file"
+        fi
+        
+        git rm --cached "$tracked_file" &> /dev/null || true
+    done <<< "$tracked_files"
+    
+    safe_remove "${N0DOM_REPO_PATH}/${rel_path}" "repo file"
+    
+    print_success "Stopped tracking: $rel_path"
+}
+
+# ============================================
+# ADDITIONAL COMMANDS FROM EXAMPLES
+# ============================================
+
+show_diff() {
+    local file="${1:-}"
+    
+    if [[ ! -d "$N0DOM_REPO_PATH/.git" ]]; then
+        print_error "Repository not initialized"
+        exit 5
+    fi
+    
+    cd "$N0DOM_REPO_PATH" || exit 5
+    
+    if [[ -n "$file" ]]; then
+        # Show diff for specific file
+        local rel_path="${file#$HOME/}"
+        local repo_file="$N0DOM_REPO_PATH/$rel_path"
+        local home_file="$HOME/$rel_path"
+        
+        if [[ ! -f "$repo_file" ]]; then
+            print_error "File not tracked: $rel_path"
+            exit 5
+        fi
+        
+        if [[ ! -e "$home_file" ]]; then
+            print_error "Home file doesn't exist: $home_file"
+            exit 5
+        fi
+        
+        echo -e "${BOLD}Diff for: $rel_path${RESET}"
+        echo
+        diff -u "$repo_file" "$home_file" || true
+    else
+        # Show all diffs
+        print_info "Comparing repository with home directory..."
+        echo
+        
+        local has_diffs=false
+        while IFS= read -r -d '' tracked_file; do
+            local repo_file="$N0DOM_REPO_PATH/$tracked_file"
+            local home_file="$HOME/$tracked_file"
+            
+            [[ -L "$home_file" ]] && continue
+            [[ ! -e "$home_file" ]] && continue
+            
+            if ! diff -q "$repo_file" "$home_file" &> /dev/null; then
+                has_diffs=true
+                echo -e "${YELLOW}${BOLD}--- $tracked_file ---${RESET}"
+                diff -u "$repo_file" "$home_file" || true
+                echo
+            fi
+        done < <(git ls-files -z)
+        
+        if [[ "$has_diffs" == "false" ]]; then
+            print_success "All tracked files are in sync"
+        fi
+    fi
+}
+
+show_check() {
+    if [[ ! -d "$N0DOM_REPO_PATH/.git" ]]; then
+        print_error "Repository not initialized"
+        exit 5
+    fi
+    
+    cd "$N0DOM_REPO_PATH" || exit 5
+    
+    print_info "Checking dotfiles integrity..."
+    echo
+    
+    local issues=0
+    local broken_symlinks=()
+    local modified_files=()
+    local missing_files=()
+    
+    while IFS= read -r -d '' file; do
+        [[ -z "$file" ]] && continue
+        
+        # Skip ignored files
+        if is_ignored "$file"; then
+            continue
+        fi
+        
+        local home_file="$HOME/$file"
+        local repo_file="$N0DOM_REPO_PATH/$file"
+        
+        # Check for broken symlinks
+        if [[ -L "$home_file" && ! -e "$home_file" ]]; then
+            broken_symlinks+=("$file")
+            ((issues++)) || true
+        fi
+        
+        # Check for modified files (not symlinked but different)
+        if [[ -f "$home_file" && ! -L "$home_file" && -f "$repo_file" ]]; then
+            if ! diff -q "$home_file" "$repo_file" &> /dev/null; then
+                modified_files+=("$file")
+                ((issues++)) || true
+            fi
+        fi
+        
+        # Check for missing files
+        if [[ ! -e "$home_file" && ! -L "$home_file" && -e "$repo_file" ]]; then
+            missing_files+=("$file")
+            ((issues++)) || true
+        fi
+    done < <(git ls-files -z)
+    
+    # Report results
+    if [[ ${#broken_symlinks[@]} -gt 0 ]]; then
+        echo -e "${RED}${BOLD}Broken symlinks:${RESET}"
+        for f in "${broken_symlinks[@]}"; do
+            echo "  ${CROSS} $f"
+        done
+        echo
+    fi
+    
+    if [[ ${#modified_files[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}${BOLD}Modified (not symlinked):${RESET}"
+        for f in "${modified_files[@]}"; do
+            echo "  ${WARN} $f"
+        done
+        echo
+    fi
+    
+    if [[ ${#missing_files[@]} -gt 0 ]]; then
+        echo -e "${BLUE}${BOLD}Missing in home:${RESET}"
+        for f in "${missing_files[@]}"; do
+            echo "  ${INFO} $f"
+        done
+        echo
+    fi
+    
+    if [[ $issues -eq 0 ]]; then
+        print_success "All dotfiles are healthy!"
+    else
+        print_warning "Found $issues issue(s). Run 'n0dom sync' to fix."
+    fi
+}
+
+clean_broken() {
+    if [[ ! -d "$N0DOM_REPO_PATH/.git" ]]; then
+        print_error "Repository not initialized"
+        exit 5
+    fi
+    
+    cd "$N0DOM_REPO_PATH" || exit 5
+    
+    print_info "Checking for broken symlinks..."
+    
+    local cleaned=0
+    while IFS= read -r -d '' file; do
+        [[ -z "$file" ]] && continue
+        
+        local home_file="$HOME/$file"
+        
+        if [[ -L "$home_file" ]] && [[ ! -e "$home_file" ]]; then
+            safe_remove "$home_file" "broken symlink"
+            print_success "Removed broken symlink: $file"
+            ((cleaned++)) || true
+        fi
+    done < <(git ls-files -z)
+    
+    if [[ "$cleaned" -eq 0 ]]; then
+        print_success "No broken symlinks found"
+    else
+        echo
+        print_success "Cleaned $cleaned broken symlink(s)"
+    fi
+}
+
+add_untracked() {
+    if [[ ! -d "$N0DOM_REPO_PATH/.git" ]]; then
+        print_error "Repository not initialized"
+        exit 5
+    fi
+    
+    cd "$N0DOM_REPO_PATH" || exit 5
+    
+    print_info "Scanning for untracked files in tracked directories..."
+    echo
+    
+    # Get tracked directories
+    local tracked_dirs=()
+    while IFS= read -r file; do
+        if [[ "$file" == *"/"* ]]; then
+            local dir
+            dir=$(dirname "$file")
+            if [[ ! " ${tracked_dirs[*]} " =~ " ${dir} " ]]; then
+                tracked_dirs+=("$dir")
+            fi
+        fi
+    done < <(git ls-files)
+    
+    local added=0
+    for dir in "${tracked_dirs[@]}"; do
+        local home_dir="$HOME/$dir"
+        local repo_dir="$N0DOM_REPO_PATH/$dir"
+        
+        [[ ! -d "$home_dir" ]] && continue
+        
+        # Find untracked files in this directory
+        while IFS= read -r -d '' file; do
+            local rel_path="${file#$HOME/}"
+            
+            # Skip if already tracked
+            git ls-files "$rel_path" | grep -q "^${rel_path}$" && continue
+            
+            # Skip ignored files
+            if is_ignored "$rel_path"; then
+                continue
+            fi
+            
+            # Skip common non-dotfiles
+            local basename
+            basename=$(basename "$file")
+            [[ "$basename" == ".git" ]] && continue
+            [[ "$basename" == ".n0domignore" ]] && continue
+            [[ "$basename" == *.tmp ]] && continue
+            [[ "$basename" == *.log ]] && continue
+            [[ "$basename" == *~ ]] && continue
+            
+            # Add file
+            local repo_file="$N0DOM_REPO_PATH/$rel_path"
+            mkdir -p "$(dirname "$repo_file")"
+            cp -r "$file" "$repo_file"
+            git add "$rel_path"
+            print_success "Added: $rel_path"
+            ((added++))
+            
+        done < <(find "$home_dir" -type f -print0 2>/dev/null)
+    done
+    
+    if [[ $added -eq 0 ]]; then
+        print_success "No new untracked files found"
+    else
+        echo
+        print_success "Added $added new file(s)"
+        print_info "Run 'n0dom sync' to upload changes"
+    fi
+}
+
+# ============================================
+# STATUS & INFO
+# ============================================
+
+show_status() {
+    if [[ ! -d "$N0DOM_REPO_PATH/.git" ]]; then
+        print_error "Repository not initialized"
+        print_info "Run 'n0dom init' to create a new repository"
+        print_info "Run 'n0dom clone <repo>' to restore from existing"
+        exit 5
+    fi
+    
+    cd "$N0DOM_REPO_PATH" || exit 5
+    
+    print_info "N0DOM Status"
+    echo
+    
+    echo -e "${BOLD}Repository:${RESET}"
+    echo "  Local path: $N0DOM_REPO_PATH"
+    echo "  Remote URL: $(git remote get-url origin 2>/dev/null || echo 'Not set')"
+    echo "  Branch: $(git branch --show-current)"
+    echo
+    
+    echo -e "${BOLD}Tracked Files:${RESET}"
+    
+    local total_files
+    total_files=$(git ls-files 2>/dev/null | wc -l)
+    
+    if [[ "$total_files" -eq 0 ]]; then
+        echo "  No files tracked yet"
+        echo
+        print_info "Add files with: n0dom track <path>"
+        return 0
+    fi
+    
+    local linked_files=0
+    local modified_files=0
+    local missing_files=0
+    
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        
+        # Skip ignored files (don't count them in totals)
+        if is_ignored "$file"; then
+            ((total_files--)) || true
+            continue
+        fi
+        
+        local home_file="$HOME/$file"
+        
+        if [[ -L "$home_file" ]]; then
+            local target
+            target=$(readlink "$home_file" 2>/dev/null || echo "")
+            if [[ "$target" == "$N0DOM_REPO_PATH"* ]]; then
+                ((linked_files++)) || true
+            fi
+        elif [[ -f "$home_file" ]]; then
+            if [[ -f "$N0DOM_REPO_PATH/$file" ]]; then
+                if ! diff -q "$home_file" "$N0DOM_REPO_PATH/$file" &> /dev/null; then
+                    ((modified_files++)) || true
+                fi
+            fi
+        else
+            ((missing_files++)) || true
+        fi
+    done < <(git ls-files 2>/dev/null)
+    
+    echo "  Total tracked: $total_files"
+    echo "  Active (symlinked): $linked_files"
+    echo "  Modified (need sync): $modified_files"
+    echo "  Missing in home: $missing_files"
+    echo "  Pending sync: $((total_files - linked_files - missing_files))"
+    echo
+    
+    echo -e "${BOLD}Git Status:${RESET}"
+    if [[ -n $(git status --porcelain 2>/dev/null) ]]; then
+        echo "  Uncommitted changes detected"
+        git status --short 2>/dev/null | head -10
+        local more
+        more=$(git status --porcelain 2>/dev/null | wc -l)
+        if [[ "$more" -gt 10 ]]; then
+            echo "  ... and $((more - 10)) more"
+        fi
+    else
+        echo "  Working directory clean"
+    fi
+    
+    if git remote get-url origin &> /dev/null; then
+        git fetch origin &> /dev/null || true
+        local current_branch
+        current_branch=$(git branch --show-current 2>/dev/null)
+        local behind
+        behind=$(git rev-list HEAD..origin/"$current_branch" --count 2>/dev/null || echo "0")
+        if [[ "$behind" -gt 0 ]]; then
+            echo
+            print_warning "$behind commit(s) behind remote. Run 'n0dom pull' to update."
+        fi
+        
+        local ahead
+        ahead=$(git rev-list origin/"$current_branch"..HEAD --count 2>/dev/null || echo "0")
+        if [[ "$ahead" -gt 0 ]]; then
+            echo
+            print_info "$ahead commit(s) ahead of remote. Run 'n0dom sync' to push."
+        fi
+    fi
+}
+
+run_diagnostics() {
+    echo -e "${BOLD}N0DOM Doctor${RESET} - Diagnostics"
+    echo
+    
+    local issues=()
+    local fixes_available=()
+    
+    echo -e "${BOLD}Checking dependencies...${RESET}"
+    local missing_deps=()
+    
+    if command -v git &> /dev/null; then
+        print_success "git: $(git --version | awk '{print $3}')"
+    else
+        print_error "git: not found"
+        missing_deps+=("git")
+        issues+=("missing:git")
+    fi
+    
+    if command -v gh &> /dev/null; then
+        print_success "gh: $(gh --version | head -1 | awk '{print $3}')"
+    else
+        print_error "gh: not found"
+        missing_deps+=("github-cli")
+        issues+=("missing:gh")
+    fi
+    
+    if command -v yq &> /dev/null; then
+        print_success "yq: installed"
+    else
+        print_warning "yq: not found (optional, for config file support)"
+    fi
+    
+    if command -v meld &> /dev/null; then
+        print_success "meld: installed"
+    else
+        print_warning "meld: not found (optional, for conflict resolution)"
+    fi
+    
+    echo
+    echo -e "${BOLD}Checking Git configuration...${RESET}"
+    
+    if git config --global user.email &> /dev/null; then
+        print_success "git user.email: $(git config --global user.email)"
+    else
+        print_error "git user.email: not set"
+        issues+=("git:email")
+        fixes_available+=("git:email")
+    fi
+    
+    if git config --global user.name &> /dev/null; then
+        print_success "git user.name: $(git config --global user.name)"
+    else
+        print_error "git user.name: not set"
+        issues+=("git:name")
+        fixes_available+=("git:name")
+    fi
+    
+    echo
+    echo -e "${BOLD}Checking GitHub authentication...${RESET}"
+    
+    if gh auth status &> /dev/null; then
+        local gh_user
+        gh_user=$(gh api user -q '.login' 2>/dev/null || echo "unknown")
+        print_success "Authenticated as: $gh_user"
+    else
+        print_error "Not authenticated with GitHub"
+        issues+=("gh:auth")
+        fixes_available+=("gh:auth")
+    fi
+    
+    echo
+    echo -e "${BOLD}Checking n0dom setup...${RESET}"
+    
+    if [[ -d "$N0DOM_REPO_PATH/.git" ]]; then
+        print_success "Repository: initialized at $N0DOM_REPO_PATH"
+        
+        cd "$N0DOM_REPO_PATH" || exit 5
+        
+        local total_tracked
+        total_tracked=$(git ls-files | wc -l)
+        echo "  Tracked files: $total_tracked"
+        
+        local remote_url
+        remote_url=$(git remote get-url origin 2>/dev/null || echo "")
+        if [[ -n "$remote_url" ]]; then
+            echo "  Remote: $remote_url"
+        else
+            print_warning "  Remote: not configured"
+        fi
+        
+        if [[ -f "$N0DOM_REPO_PATH/$N0DOM_IGNORE_FILE" ]]; then
+            print_success "Ignore file: present"
+        else
+            print_warning "Ignore file: missing"
+            issues+=("n0dom:ignore")
+            fixes_available+=("n0dom:ignore")
+        fi
+    else
+        print_warning "Repository: not initialized"
+        issues+=("n0dom:init")
+        fixes_available+=("n0dom:init")
+    fi
+    
+    echo
+    echo -e "${BOLD}Checking backup system...${RESET}"
+    
+    if [[ -d "$N0DOM_BACKUP_DIR" ]]; then
+        local backup_count
+        backup_count=$(find "$N0DOM_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)
+        print_success "Backup directory: $backup_count backup(s)"
+    else
+        print_warning "Backup directory: not found (will be created on first backup)"
+    fi
+    
+    echo
+    echo -e "${BOLD}Checking for common issues...${RESET}"
+    
+    local broken_links=0
+    if [[ -d "$N0DOM_REPO_PATH/.git" ]]; then
+        cd "$N0DOM_REPO_PATH" || exit 5
+        
+        while IFS= read -r -d '' file; do
+            local home_file="$HOME/$file"
+            if [[ -L "$home_file" ]] && [[ ! -e "$home_file" ]]; then
+                ((broken_links++))
+            fi
+        done < <(git ls-files -z)
+        
+        if [[ $broken_links -gt 0 ]]; then
+            print_warning "Broken symlinks: $broken_links found"
+            issues+=("n0dom:broken_links")
+            fixes_available+=("n0dom:broken_links")
+        else
+            print_success "Broken symlinks: none"
+        fi
+    fi
+    
+    echo
+    echo -e "${BOLD}Summary:${RESET}"
+    if [[ ${#issues[@]} -eq 0 ]]; then
+        print_success "All checks passed!"
+        return 0
+    fi
+    
+    print_warning "${#issues[@]} issue(s) found"
+    
+    if [[ ${#fixes_available[@]} -gt 0 ]]; then
+        echo
+        if confirm_action "Would you like to fix these issues now?" "y"; then
+            echo
+            doctor_fix_issues "${fixes_available[@]}"
+        fi
+    fi
+}
+
+doctor_fix_issues() {
+    local issues=("$@")
+    
+    for issue in "${issues[@]}"; do
+        echo
+        case "$issue" in
+            missing:git|missing:gh)
+                doctor_fix_missing_dep "$issue"
+                ;;
+            git:email)
+                doctor_fix_git_email
+                ;;
+            git:name)
+                doctor_fix_git_name
+                ;;
+            gh:auth)
+                doctor_fix_gh_auth
+                ;;
+            n0dom:init)
+                doctor_fix_n0dom_init
+                ;;
+            n0dom:ignore)
+                doctor_fix_n0dom_ignore
+                ;;
+            n0dom:broken_links)
+                doctor_fix_broken_links
+                ;;
+        esac
+    done
+    
+    echo
+    print_success "Fix complete! Running doctor again..."
+    echo
+    run_diagnostics
+}
+
+doctor_fix_missing_dep() {
+    local issue="$1"
+    local dep=""
+    
+    case "$issue" in
+        missing:git) dep="git" ;;
+        missing:gh) dep="github-cli" ;;
+    esac
+    
+    print_info "Installing $dep..."
+    
+    if command -v yay &> /dev/null; then
+        yay -S --noconfirm "$dep" && print_success "Installed $dep"
+    elif command -v paru &> /dev/null; then
+        paru -S --noconfirm "$dep" && print_success "Installed $dep"
+    elif command -v pacman &> /dev/null; then
+        sudo pacman -S --noconfirm "$dep" && print_success "Installed $dep"
+    else
+        print_error "No package manager found. Install $dep manually."
+    fi
+}
+
+doctor_fix_git_email() {
+    print_info "Git user.email is required for commits"
+    
+    local gh_email=""
+    if command -v gh &> /dev/null && gh auth status &> /dev/null; then
+        local gh_user
+        gh_user=$(gh api user -q '.login' 2>/dev/null || echo "")
+        if [[ -n "$gh_user" ]]; then
+            gh_email="${gh_user}@users.noreply.github.com"
+            print_info "Detected GitHub username: $gh_user"
+            if confirm_action "Use GitHub email: $gh_email?" "y"; then
+                git config --global user.email "$gh_email"
+                print_success "Git user.email configured"
+                return
+            fi
+        fi
+    fi
+    
+    read -p "Enter your email address: " email
+    if [[ -n "$email" ]]; then
+        git config --global user.email "$email"
+        print_success "Git user.email configured"
+    else
+        print_error "Email cannot be empty"
+    fi
+}
+
+doctor_fix_git_name() {
+    print_info "Git user.name is required for commits"
+    
+    local gh_name=""
+    if command -v gh &> /dev/null && gh auth status &> /dev/null; then
+        gh_name=$(gh api user -q '.name' 2>/dev/null || echo "")
+        if [[ -n "$gh_name" ]] && [[ "$gh_name" != "null" ]]; then
+            print_info "Detected GitHub name: $gh_name"
+            if confirm_action "Use GitHub name: $gh_name?" "y"; then
+                git config --global user.name "$gh_name"
+                print_success "Git user.name configured"
+                return
+            fi
+        fi
+        
+        local gh_user
+        gh_user=$(gh api user -q '.login' 2>/dev/null || echo "")
+        if [[ -n "$gh_user" ]]; then
+            print_info "Using GitHub username: $gh_user"
+            if confirm_action "Use username as git name: $gh_user?" "y"; then
+                git config --global user.name "$gh_user"
+                print_success "Git user.name configured"
+                return
+            fi
+        fi
+    fi
+    
+    read -p "Enter your name: " name
+    if [[ -n "$name" ]]; then
+        git config --global user.name "$name"
+        print_success "Git user.name configured"
+    else
+        print_error "Name cannot be empty"
+    fi
+}
+
+doctor_fix_gh_auth() {
+    print_info "GitHub authentication is required for repository operations"
+    
+    if ! command -v gh &> /dev/null; then
+        print_error "GitHub CLI not installed"
+        return
+    fi
+    
+    print_info "Starting GitHub authentication..."
+    print_info "This will open your browser for authentication"
+    
+    if gh auth login --web; then
+        print_success "Authenticated with GitHub"
+        local gh_user
+        gh_user=$(gh api user -q '.login' 2>/dev/null || echo "unknown")
+        echo -e "  Logged in as: ${GREEN}$gh_user${RESET}"
+    else
+        print_error "Authentication failed or cancelled"
+    fi
+}
+
+doctor_fix_n0dom_init() {
+    print_info "n0dom repository needs to be initialized"
+    echo
+    echo "Options:"
+    echo "  [1] Create new dotfiles repository (n0dom init)"
+    echo "  [2] Clone existing repository (n0dom clone)"
+    echo "  [s] Skip for now"
+    read -p "Choose [1/2/s]: " -n 1 -r
+    echo
+    
+    case "$REPLY" in
+        1)
+            check_dependencies
+            ensure_gh_auth
+            init_repo
+            ;;
+        2)
+            local repo
+            read -p "Enter repository (username/repo or URL): " repo
+            if [[ -n "$repo" ]]; then
+                check_dependencies
+                ensure_gh_auth
+                clone_repo "$repo"
+            else
+                print_error "Repository cannot be empty"
+            fi
+            ;;
+        s|S)
+            print_info "Skipped. Run 'n0dom init' or 'n0dom clone <repo>' later"
+            ;;
+        *)
+            print_warning "Invalid option"
+            ;;
+    esac
+}
+
+doctor_fix_n0dom_ignore() {
+    print_info "Creating .n0domignore file..."
+    
+    if [[ -d "$N0DOM_REPO_PATH" ]]; then
+        create_n0domignore "$N0DOM_REPO_PATH"
+        print_success "Created .n0domignore"
+    else
+        print_error "Repository directory not found"
+    fi
+}
+
+doctor_fix_broken_links() {
+    print_info "Cleaning broken symlinks..."
+    clean_broken
+}
+
+# ============================================
+# GIT OPERATIONS
+# ============================================
+
+# ============================================
+# UPDATE MECHANISM
+# ============================================
+
+self_update() {
+    print_info "Checking for updates..."
+    
+    local update_url="https://raw.githubusercontent.com/noeltz/n0dom/main/n0dom"
+    local temp_file
+    temp_file=$(mktemp)
+    
+    if curl -fsSL "$update_url" -o "$temp_file" 2>/dev/null; then
+        local current_version
+        current_version=$(grep "readonly N0DOM_VERSION=" "$0" | cut -d'"' -f2)
+        local new_version
+        new_version=$(grep "readonly N0DOM_VERSION=" "$temp_file" | cut -d'"' -f2)
+        
+        if [[ "$new_version" != "$current_version" ]]; then
+            print_info "New version available: $new_version (current: $current_version)"
+            read -p "Install update? [y/N] " -n 1 -r
+            echo
+            
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                local script_path
+                script_path=$(realpath "$0")
+                cp "$temp_file" "$script_path"
+                chmod +x "$script_path"
+                print_success "Updated to version $new_version"
+                print_info "Please restart n0dom"
+            fi
+        else
+            print_success "Already running the latest version ($current_version)"
+        fi
+    else
+        print_error "Failed to check for updates"
+        print_info "Make sure you have internet connectivity"
+    fi
+    
+    rm -f "$temp_file"
+}
+
+# ============================================
+# HELP & USAGE
+# ============================================
+
+show_help() {
+    echo -e "${BOLD}N0DOM v${N0DOM_VERSION}${RESET} - Dotfiles Manager for Arch Linux"
+    echo
+    echo "Usage: n0dom <command> [options]"
+    echo
+    echo -e "${BOLD}Setup Commands:${RESET}"
+    echo "  init                      Initialize a new dotfiles repository"
+    echo "  clone <repo>              Clone an existing repository"
+    echo
+    echo -e "${BOLD}Core Commands:${RESET}"
+    echo "  sync [message]            Full sync: pull, merge, commit, push"
+    echo "  track <path>              Add a file/directory to tracking"
+    echo "  untrack <path>            Remove a file from tracking"
+    echo "  add                       Auto-add untracked files in tracked dirs"
+    echo
+    echo -e "${BOLD}Status Commands:${RESET}"
+    echo "  status                    Show repository and sync status"
+    echo "  diff [file]               Show differences (all files or specific)"
+    echo "  check                     Check dotfiles integrity"
+    echo "  doctor                    Run diagnostics and health checks"
+    echo "  clean                     Remove broken symlinks"
+    echo
+    echo -e "${BOLD}Backup Commands:${RESET}"
+    echo "  backup                    Create manual backup"
+    echo "  restore [backup-id]       Restore from backup (lists if no ID)"
+    echo "  cleanup                   Remove old backups based on retention policy"
+    echo
+    echo -e "${BOLD}Package Commands:${RESET}"
+    echo "  packages export           Export installed packages to repo"
+    echo "  packages import           Install packages from repo"
+    echo
+    echo -e "${BOLD}Maintenance:${RESET}"
+    echo "  update                    Check for and install updates"
+    echo "  help                      Show this help message"
+    echo
+    echo -e "${BOLD}Options:${RESET}"
+    echo "  -v, --verbose             Verbose output"
+    echo "  -n, --no-backup           Skip automatic backups"
+    echo "  -d, --dry-run             Show what would be done (no changes)"
+    echo "  -y, --yes, --force        Auto-confirm all prompts"
+    echo
+    echo -e "${BOLD}Examples:${RESET}"
+    echo "  n0dom init                          # Create new dotfiles repo"
+    echo "  n0dom clone username/dotfiles       # Restore from GitHub"
+    echo "  n0dom track ~/.bashrc               # Track your .bashrc"
+    echo "  n0dom sync                          # Full sync with auto-commit"
+    echo "  n0dom sync \"Updated vim config\"    # Sync with custom message"
+    echo "  n0dom sync --dry-run                # Preview changes"
+    echo "  n0dom doctor                        # Check system health"
+    echo "  n0dom packages export               # Save package list"
+    echo
+    echo -e "${BOLD}Machine-Specific Files:${RESET}"
+    echo "  Files can have hostname-specific versions:"
+    echo "  .bashrc          # Default version"
+    echo "  .bashrc.hostname # Used on machine named 'hostname'"
+}
+
+# ============================================
+# MAIN
+# ============================================
+
+main() {
+    local verbose=false
+    local no_backup=false
+    local dry_run=false
+    local yes_mode=false
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -v|--verbose)
+                verbose=true
+                shift
+                ;;
+            -n|--no-backup)
+                no_backup=true
+                shift
+                ;;
+            -d|--dry-run)
+                dry_run=true
+                shift
+                ;;
+            -y|--yes|--force)
+                yes_mode=true
+                shift
+                ;;
+            -*)
+                print_error "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    
+    export N0DOM_YES_MODE="$yes_mode"
+    
+    local cmd="${1:-help}"
+    shift || true
+    
+    load_config
+    
+    case "$cmd" in
+        init)
+            check_dependencies
+            ensure_gh_auth
+            init_repo
+            ;;
+        clone)
+            check_dependencies
+            ensure_gh_auth
+            clone_repo "$1"
+            ;;
+        sync)
+            perform_two_way_sync "$no_backup" "$dry_run" "$verbose" "${1:-}"
+            ;;
+        track)
+            track_file "$1"
+            ;;
+        untrack)
+            untrack_file "$1"
+            ;;
+        add)
+            add_untracked
+            ;;
+        status|st)
+            show_status
+            ;;
+        diff)
+            show_diff "$1"
+            ;;
+        check)
+            show_check
+            ;;
+        clean)
+            clean_broken
+            ;;
+        doctor)
+            run_diagnostics
+            ;;
+        packages)
+            local pkg_cmd="${1:-}"
+            case "$pkg_cmd" in
+                export)
+                    export_packages
+                    ;;
+                import)
+                    import_packages
+                    ;;
+                *)
+                    print_error "Unknown packages command: $pkg_cmd"
+                    print_info "Usage: n0dom packages [export|import]"
+                    ;;
+            esac
+            ;;
+        pull)
+            print_info "Fetching changes from remote..."
+            cd "$N0DOM_REPO_PATH" || exit 5
+            git pull origin "$(git branch --show-current)" || {
+                print_error "Failed to pull from remote"
+                exit 5
+            }
+            print_success "Pulled latest changes"
+            print_info "Run 'n0dom sync' to apply changes to your home directory"
+            ;;
+        backup)
+            check_disk_space 100 "$N0DOM_BACKUP_DIR" || exit 6
+            create_backup "manual"
+            print_success "Backup created"
+            ;;
+        restore)
+            if [[ -z "${1:-}" ]]; then
+                list_backups
+            else
+                restore_backup "$1"
+            fi
+            ;;
+        cleanup)
+            print_info "Cleaning up old backups..."
+            cleanup_old_backups
+            print_success "Cleanup complete"
+            ;;
+        update|upgrade)
+            self_update
+            ;;
+        help|-h|--help)
+            show_help
+            ;;
+        version|-v|--version)
+            echo "n0dom version $N0DOM_VERSION"
+            ;;
+        *)
+            print_error "Unknown command: $cmd"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
