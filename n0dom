@@ -2292,9 +2292,19 @@ self_update() {
     
     if curl -fsSL "$update_url" -o "$temp_file" 2>/dev/null; then
         local current_version
-        current_version=$(grep "readonly N0DOM_VERSION=" "$0" | cut -d'"' -f2)
+        current_version=$(grep "^readonly N0DOM_VERSION=" "$0" | head -1 | cut -d'"' -f2)
         local new_version
-        new_version=$(grep "readonly N0DOM_VERSION=" "$temp_file" | cut -d'"' -f2)
+        new_version=$(grep "^readonly N0DOM_VERSION=" "$temp_file" | head -1 | cut -d'"' -f2)
+        
+        if [[ -z "$current_version" ]]; then
+            current_version="unknown"
+        fi
+        
+        if [[ -z "$new_version" ]]; then
+            print_error "Failed to determine remote version"
+            rm -f "$temp_file"
+            return 1
+        fi
         
         if [[ "$new_version" != "$current_version" ]]; then
             print_info "New version available: $new_version (current: $current_version)"
