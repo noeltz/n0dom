@@ -7,7 +7,7 @@ set -e
 # Usage: curl -fsSL https://raw.githubusercontent.com/noeltz/n0dom/main/install.sh | bash
 # ============================================
 
-readonly N0DOM_VERSION="1.1.0"
+readonly N0DOM_VERSION="1.2.0"
 readonly N0DOM_REPO="https://github.com/noeltz/n0dom"
 readonly INSTALL_DIR="${HOME}/.local/bin"
 readonly N0DOM_URL="${N0DOM_REPO}/raw/main/n0dom"
@@ -199,33 +199,6 @@ download_n0dom() {
     print_success "n0dom installed to ${INSTALL_DIR}/n0dom"
 }
 
-# Configure git user if not already set
-configure_git_user() {
-    if ! git config --global user.email &> /dev/null || ! git config --global user.name &> /dev/null; then
-        print_warning "Git user identity not configured globally"
-        
-        # Try to get GitHub user info from gh CLI
-        local gh_user=""
-        if command -v gh &> /dev/null && gh auth status &> /dev/null; then
-            gh_user=$(gh api user -q '.login' 2>/dev/null || echo "")
-        fi
-        
-        if [[ -n "$gh_user" ]]; then
-            local gh_email="${gh_user}@users.noreply.github.com"
-            print_info "Configuring git with GitHub username: $gh_user"
-            git config --global user.name "$gh_user"
-            git config --global user.email "$gh_email"
-            print_success "Git identity configured globally"
-        else
-            print_error "Git user identity required"
-            print_info "Please configure git manually:"
-            print_info "  git config --global user.email 'you@example.com'"
-            print_info "  git config --global user.name 'Your Name'"
-            exit 1
-        fi
-    fi
-}
-
 # Update PATH
 update_path() {
     local shell_rc=""
@@ -286,7 +259,6 @@ main() {
     
     # Install
     install_dependencies
-     # configure_git_user
     download_n0dom
     update_path
     

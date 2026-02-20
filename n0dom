@@ -6,7 +6,7 @@ set -euo pipefail
 # Version: 1.0.0
 # ============================================
 
-readonly N0DOM_VERSION="1.1.0"
+readonly N0DOM_VERSION="1.2.0"
 readonly N0DOM_CONFIG_DIR="${HOME}/.config/n0dom"
 readonly N0DOM_DATA_DIR="${HOME}/.local/share/n0dom"
 readonly N0DOM_DEFAULT_REPO="${N0DOM_DATA_DIR}/repo"
@@ -242,14 +242,34 @@ export_packages() {
     local package_file="$N0DOM_REPO_PATH/.n0dom-packages"
     
     print_info "Exporting installed packages..."
-    pacman -Qqe > "$package_file"
     
-    local count
-    count=$(wc -l < "$package_file")
+    local aur_packages
+    aur_packages=$(comm -23 <(pacman -Qqe | sort) <(pacman -Slq | sort) 2>/dev/null)
+    
+    local repo_packages
+    repo_packages=$(comm -12 <(pacman -Qqe | sort) <(pacman -Slq | sort) 2>/dev/null)
+    
+    {
+        echo "# n0dom package list v2"
+        echo "# Format: package:origin"
+        echo "# Origins: repo, aur"
+        echo ""
+        while IFS= read -r pkg; do
+            [[ -n "$pkg" ]] && echo "${pkg}:repo"
+        done <<< "$repo_packages"
+        while IFS= read -r pkg; do
+            [[ -n "$pkg" ]] && echo "${pkg}:aur"
+        done <<< "$aur_packages"
+    } > "$package_file"
+    
+    local repo_count aur_count total
+    repo_count=$(echo "$repo_packages" | grep -c . 2>/dev/null || echo 0)
+    aur_count=$(echo "$aur_packages" | grep -c . 2>/dev/null || echo 0)
+    total=$((repo_count + aur_count))
     
     cd "$N0DOM_REPO_PATH" || return 1
     git add ".n0dom-packages"
-    print_success "Exported $count packages to .n0dom-packages"
+    print_success "Exported $total packages ($repo_count repo, $aur_count AUR)"
 }
 
 import_packages() {
@@ -265,18 +285,64 @@ import_packages() {
         return 1
     fi
     
-    local count
-    count=$(wc -l < "$package_file")
+    local aur_helper=""
+    if command -v paru &> /dev/null; then
+        aur_helper="paru"
+    elif command -v yay &> /dev/null; then
+        aur_helper="yay"
+    fi
     
-    print_info "Found $count packages in .n0dom-packages"
+    local repo_packages=()
+    local aur_packages=()
+    local line_num=0
+    
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++)) || true
+        [[ -z "$line" ]] && continue
+        [[ "$line" == \#* ]] && continue
+        
+        if [[ "$line" == *:* ]]; then
+            local pkg="${line%%:*}"
+            local origin="${line##*:}"
+            
+            case "$origin" in
+                repo) repo_packages+=("$pkg") ;;
+                aur) aur_packages+=("$pkg") ;;
+                *)
+                    print_warning "Unknown origin '$origin' on line $line_num, skipping"
+                    ;;
+            esac
+        else
+            repo_packages+=("$line")
+        fi
+    done < "$package_file"
+    
+    local repo_count=${#repo_packages[@]}
+    local aur_count=${#aur_packages[@]}
+    local total=$((repo_count + aur_count))
+    
+    print_info "Found $total packages ($repo_count repo, $aur_count AUR)"
+    
+    if [[ $aur_count -gt 0 ]] && [[ -z "$aur_helper" ]]; then
+        print_error "AUR packages found but no AUR helper installed"
+        print_info "Install paru or yay to import AUR packages"
+        return 1
+    fi
     
     if ! confirm_action "Install missing packages?" "n"; then
         print_info "Package import cancelled"
         return 0
     fi
     
-    print_info "Installing packages..."
-    sudo pacman -S --needed - < "$package_file"
+    if [[ $repo_count -gt 0 ]]; then
+        print_info "Installing $repo_count repo packages..."
+        printf '%s\n' "${repo_packages[@]}" | sudo pacman -S --needed -
+    fi
+    
+    if [[ $aur_count -gt 0 ]]; then
+        print_info "Installing $aur_count AUR packages with $aur_helper..."
+        printf '%s\n' "${aur_packages[@]}" | $aur_helper -S --needed -
+    fi
     
     print_success "Package import completed"
 }
@@ -1373,7 +1439,7 @@ perform_two_way_sync() {
                 mkdir -p "$(dirname "$home_file")"
                 ln -s "$repo_file" "$home_file"
                 print_success "Resolved (repo): $file"
-                ((conflicts_resolved++))
+                ((conflicts_resolved++)) || true
                 ;;
             1)
                 cp -r "$home_file" "$repo_file"
@@ -1381,7 +1447,7 @@ perform_two_way_sync() {
                 safe_remove "$home_file" "original file"
                 ln -s "$repo_file" "$home_file"
                 print_success "Resolved (home): $file"
-                ((conflicts_resolved++))
+                ((conflicts_resolved++)) || true
                 ;;
             *)
                 print_warning "Skipped: $file"
@@ -1618,86 +1684,6 @@ show_diff() {
     fi
 }
 
-show_check() {
-    if [[ ! -d "$N0DOM_REPO_PATH/.git" ]]; then
-        print_error "Repository not initialized"
-        exit 5
-    fi
-    
-    cd "$N0DOM_REPO_PATH" || exit 5
-    
-    print_info "Checking dotfiles integrity..."
-    echo
-    
-    local issues=0
-    local broken_symlinks=()
-    local modified_files=()
-    local missing_files=()
-    
-    while IFS= read -r -d '' file; do
-        [[ -z "$file" ]] && continue
-        
-        # Skip ignored files
-        if is_ignored "$file"; then
-            continue
-        fi
-        
-        local home_file="$HOME/$file"
-        local repo_file="$N0DOM_REPO_PATH/$file"
-        
-        # Check for broken symlinks
-        if [[ -L "$home_file" && ! -e "$home_file" ]]; then
-            broken_symlinks+=("$file")
-            ((issues++)) || true
-        fi
-        
-        # Check for modified files (not symlinked but different)
-        if [[ -f "$home_file" && ! -L "$home_file" && -f "$repo_file" ]]; then
-            if ! diff -q "$home_file" "$repo_file" &> /dev/null; then
-                modified_files+=("$file")
-                ((issues++)) || true
-            fi
-        fi
-        
-        # Check for missing files
-        if [[ ! -e "$home_file" && ! -L "$home_file" && -e "$repo_file" ]]; then
-            missing_files+=("$file")
-            ((issues++)) || true
-        fi
-    done < <(git ls-files -z)
-    
-    # Report results
-    if [[ ${#broken_symlinks[@]} -gt 0 ]]; then
-        echo -e "${RED}${BOLD}Broken symlinks:${RESET}"
-        for f in "${broken_symlinks[@]}"; do
-            echo "  ${CROSS} $f"
-        done
-        echo
-    fi
-    
-    if [[ ${#modified_files[@]} -gt 0 ]]; then
-        echo -e "${YELLOW}${BOLD}Modified (not symlinked):${RESET}"
-        for f in "${modified_files[@]}"; do
-            echo "  ${WARN} $f"
-        done
-        echo
-    fi
-    
-    if [[ ${#missing_files[@]} -gt 0 ]]; then
-        echo -e "${BLUE}${BOLD}Missing in home:${RESET}"
-        for f in "${missing_files[@]}"; do
-            echo "  ${INFO} $f"
-        done
-        echo
-    fi
-    
-    if [[ $issues -eq 0 ]]; then
-        print_success "All dotfiles are healthy!"
-    else
-        print_warning "Found $issues issue(s). Run 'n0dom sync' to fix."
-    fi
-}
-
 clean_broken() {
     if [[ ! -d "$N0DOM_REPO_PATH/.git" ]]; then
         print_error "Repository not initialized"
@@ -1837,18 +1823,24 @@ show_status() {
     
     local linked_files=0
     local modified_files=0
-    local missing_files=0
+    local missing_in_home=0
+    local deleted_from_repo=0
     
     while IFS= read -r file; do
         [[ -z "$file" ]] && continue
         
-        # Skip ignored files (don't count them in totals)
         if is_ignored "$file"; then
             ((total_files--)) || true
             continue
         fi
         
         local home_file="$HOME/$file"
+        local repo_file="$N0DOM_REPO_PATH/$file"
+        
+        if [[ ! -e "$repo_file" ]]; then
+            ((deleted_from_repo++)) || true
+            continue
+        fi
         
         if [[ -L "$home_file" ]]; then
             local target
@@ -1857,21 +1849,22 @@ show_status() {
                 ((linked_files++)) || true
             fi
         elif [[ -f "$home_file" ]]; then
-            if [[ -f "$N0DOM_REPO_PATH/$file" ]]; then
-                if ! diff -q "$home_file" "$N0DOM_REPO_PATH/$file" &> /dev/null; then
-                    ((modified_files++)) || true
-                fi
+            if ! diff -q "$home_file" "$repo_file" &> /dev/null; then
+                ((modified_files++)) || true
             fi
         else
-            ((missing_files++)) || true
+            ((missing_in_home++)) || true
         fi
     done < <(git ls-files 2>/dev/null)
+    
+    local pending=$((total_files - linked_files - missing_in_home - deleted_from_repo))
     
     echo "  Total tracked: $total_files"
     echo "  Active (symlinked): $linked_files"
     echo "  Modified (need sync): $modified_files"
-    echo "  Missing in home: $missing_files"
-    echo "  Pending sync: $((total_files - linked_files - missing_files))"
+    echo "  Missing in home: $missing_in_home"
+    echo "  Deleted from repo: $deleted_from_repo"
+    echo "  Pending sync: $pending"
     echo
     
     echo -e "${BOLD}Git Status:${RESET}"
@@ -1908,6 +1901,8 @@ show_status() {
 }
 
 run_diagnostics() {
+    local check_only="${1:-false}"
+    
     echo -e "${BOLD}N0DOM Doctor${RESET} - Diagnostics"
     echo
     
@@ -2051,13 +2046,34 @@ run_diagnostics() {
     echo -e "${BOLD}Checking for common issues...${RESET}"
     
     local broken_links=0
+    local modified_files=0
+    local missing_files=0
+    
     if [[ -d "$N0DOM_REPO_PATH/.git" ]]; then
         cd "$N0DOM_REPO_PATH" || exit 5
         
         while IFS= read -r -d '' file; do
+            [[ -z "$file" ]] && continue
+            
+            if is_ignored "$file"; then
+                continue
+            fi
+            
             local home_file="$HOME/$file"
+            local repo_file="$N0DOM_REPO_PATH/$file"
+            
             if [[ -L "$home_file" ]] && [[ ! -e "$home_file" ]]; then
-                ((broken_links++))
+                ((broken_links++)) || true
+            fi
+            
+            if [[ -f "$home_file" && ! -L "$home_file" && -f "$repo_file" ]]; then
+                if ! diff -q "$home_file" "$repo_file" &> /dev/null; then
+                    ((modified_files++)) || true
+                fi
+            fi
+            
+            if [[ ! -e "$home_file" && ! -L "$home_file" && -e "$repo_file" ]]; then
+                ((missing_files++)) || true
             fi
         done < <(git ls-files -z)
         
@@ -2067,6 +2083,22 @@ run_diagnostics() {
             fixes_available+=("n0dom:broken_links")
         else
             print_success "Broken symlinks: none"
+        fi
+        
+        if [[ $modified_files -gt 0 ]]; then
+            print_warning "Modified files (not symlinked): $modified_files found"
+            issues+=("n0dom:modified_files")
+            fixes_available+=("n0dom:modified_files")
+        else
+            print_success "Modified files: none"
+        fi
+        
+        if [[ $missing_files -gt 0 ]]; then
+            print_warning "Missing files (not in home): $missing_files found"
+            issues+=("n0dom:missing_files")
+            fixes_available+=("n0dom:missing_files")
+        else
+            print_success "Missing files: none"
         fi
     fi
     
@@ -2078,6 +2110,10 @@ run_diagnostics() {
     fi
     
     print_warning "${#issues[@]} issue(s) found"
+    
+    if [[ "$check_only" == "true" ]]; then
+        return 1
+    fi
     
     if [[ ${#fixes_available[@]} -gt 0 ]]; then
         echo
@@ -2114,6 +2150,12 @@ doctor_fix_issues() {
                 ;;
             n0dom:broken_links)
                 doctor_fix_broken_links
+                ;;
+            n0dom:modified_files)
+                doctor_fix_modified_files
+                ;;
+            n0dom:missing_files)
+                doctor_fix_missing_files
                 ;;
         esac
     done
@@ -2282,6 +2324,47 @@ doctor_fix_broken_links() {
     clean_broken
 }
 
+doctor_fix_modified_files() {
+    print_info "Running sync to resolve modified files..."
+    perform_two_way_sync "false" "false" "false" "Doctor: resolve modified files"
+}
+
+doctor_fix_missing_files() {
+    print_info "Creating symlinks for missing files..."
+    
+    if [[ ! -d "$N0DOM_REPO_PATH/.git" ]]; then
+        print_error "Repository not initialized"
+        return 1
+    fi
+    
+    cd "$N0DOM_REPO_PATH" || return 1
+    
+    local linked=0
+    while IFS= read -r -d '' file; do
+        [[ -z "$file" ]] && continue
+        
+        if is_ignored "$file"; then
+            continue
+        fi
+        
+        local home_file="$HOME/$file"
+        local repo_file="$N0DOM_REPO_PATH/$file"
+        
+        if [[ ! -e "$home_file" && ! -L "$home_file" && -e "$repo_file" ]]; then
+            mkdir -p "$(dirname "$home_file")"
+            ln -s "$repo_file" "$home_file"
+            print_success "Linked: $file"
+            ((linked++)) || true
+        fi
+    done < <(git ls-files -z)
+    
+    if [[ $linked -eq 0 ]]; then
+        print_info "No missing files to link"
+    else
+        print_success "Created $linked symlink(s)"
+    fi
+}
+
 # ============================================
 # GIT OPERATIONS
 # ============================================
@@ -2359,7 +2442,6 @@ show_help() {
     echo -e "${BOLD}Status Commands:${RESET}"
     echo "  status                    Show repository and sync status"
     echo "  diff [file]               Show differences (all files or specific)"
-    echo "  check                     Check dotfiles integrity"
     echo "  doctor                    Run diagnostics and health checks"
     echo "  clean                     Remove broken symlinks"
     echo
@@ -2381,6 +2463,7 @@ show_help() {
     echo "  -n, --no-backup           Skip automatic backups"
     echo "  -d, --dry-run             Show what would be done (no changes)"
     echo "  -y, --yes, --force        Auto-confirm all prompts"
+    echo "  -c, --check               Non-interactive mode (for doctor)"
     echo
     echo -e "${BOLD}Examples:${RESET}"
     echo "  n0dom init                          # Create new dotfiles repo"
@@ -2407,6 +2490,7 @@ main() {
     local no_backup=false
     local dry_run=false
     local yes_mode=false
+    local check_only=false
     
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -2424,6 +2508,10 @@ main() {
                 ;;
             -y|--yes|--force)
                 yes_mode=true
+                shift
+                ;;
+            -c|--check)
+                check_only=true
                 shift
                 ;;
             -*)
@@ -2473,14 +2561,11 @@ main() {
         diff)
             show_diff "$1"
             ;;
-        check)
-            show_check
-            ;;
         clean)
             clean_broken
             ;;
         doctor)
-            run_diagnostics
+            run_diagnostics "$check_only"
             ;;
         packages)
             local pkg_cmd="${1:-}"

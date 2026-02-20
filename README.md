@@ -6,7 +6,7 @@
 
 *Simplify your configuration management with intelligent two-way sync*
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/noeltz/n0dom)
+[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](https://github.com/noeltz/n0dom)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Arch Linux](https://img.shields.io/badge/Arch%20Linux-supported-1793d1.svg)](https://archlinux.org)
 
@@ -93,7 +93,6 @@ n0dom packages import           # Install packages (optional)
 |---------|-------------|
 | `n0dom status` | Show repository and sync status |
 | `n0dom diff [file]` | Show differences between repo and home |
-| `n0dom check` | Check dotfiles integrity |
 | `n0dom doctor` | Run diagnostics and health checks |
 | `n0dom clean` | Remove broken symlinks |
 
@@ -128,6 +127,7 @@ All commands support these global options:
 -n, --no-backup        Skip automatic backups
 -d, --dry-run          Preview changes without applying
 -y, --yes, --force     Auto-confirm all prompts
+-c, --check            Non-interactive mode (for doctor: report only, exit 1 on issues)
 ```
 
 ## How It Works
@@ -243,8 +243,29 @@ n0dom packages export
 
 # Import on a new machine
 n0dom packages import
-# Installs all packages from the list
+# Installs packages using pacman (repo) and AUR helper (AUR)
 ```
+
+**Package file format** (`.n0dom-packages`):
+
+```
+# n0dom package list v2
+# Format: package:origin
+# Origins: repo, aur
+
+git:repo
+vim:repo
+neovim:repo
+yay:aur
+google-chrome:aur
+```
+
+- **Repo packages**: Installed with `pacman`
+- **AUR packages**: Installed with `paru` or `yay` (auto-detected)
+
+**Requirements:**
+- AUR packages require an AUR helper (`paru` or `yay`) to be installed
+- Import will fail if AUR packages are found but no AUR helper is available
 
 ### Conflict Resolution
 
@@ -379,13 +400,25 @@ Summary:
 - Uninitialized repository
 - Missing .n0domignore file
 - Broken symlinks
+- Modified files (not symlinked)
+- Missing files (not in home directory)
+
+**Non-interactive mode:**
+
+Use `--check` for CI/CD or scripts:
+
+```bash
+$ n0dom doctor --check
+# Reports issues and exits with code 1 if problems found
+# No prompts, no fixes applied
+```
 
 ## Configuration
 
 Optional YAML configuration at `~/.config/n0dom/config.yaml`:
 
 ```yaml
-version: "1.1.0"
+version: "1.2.0"
 
 repo:
   url: "https://github.com/username/dotfiles"
