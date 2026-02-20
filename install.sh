@@ -286,7 +286,7 @@ main() {
     
     # Install
     install_dependencies
-    configure_git_user
+     # configure_git_user
     download_n0dom
     update_path
     
