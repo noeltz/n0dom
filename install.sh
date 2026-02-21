@@ -7,7 +7,7 @@ set -e
 # Usage: curl -fsSL https://raw.githubusercontent.com/noeltz/n0dom/main/install.sh | bash
 # ============================================
 
-readonly N0DOM_VERSION="1.2.0"
+readonly N0DOM_VERSION="1.3.0"
 readonly N0DOM_REPO="https://github.com/noeltz/n0dom"
 readonly INSTALL_DIR="${HOME}/.local/bin"
 readonly N0DOM_URL="${N0DOM_REPO}/raw/main/n0dom"

@@ -6,7 +6,7 @@ set -euo pipefail
 # Version: 1.0.0
 # ============================================
 
-readonly N0DOM_VERSION="1.2.0"
+readonly N0DOM_VERSION="1.3.0"
 readonly N0DOM_CONFIG_DIR="${HOME}/.config/n0dom"
 readonly N0DOM_DATA_DIR="${HOME}/.local/share/n0dom"
 readonly N0DOM_DEFAULT_REPO="${N0DOM_DATA_DIR}/repo"
@@ -1056,18 +1056,23 @@ resolve_two_way_conflict() {
         case "$REPLY" in
             m|M)
                 print_info "Opening $selected_tool for merge resolution..."
+                print_info "Edit the RIGHT panel (repo version) and save it"
                 run_merge_tool "$selected_tool" "$home_file" "$temp_file"
                 
                 echo
-                read -p "Use merged version? [y/n/c] (y=repo, n=home, c=cancel): " -n 1 -r
+                echo "Which version should be used?"
+                echo "  [r] Use repo/merged version (the right panel you edited)"
+                echo "  [l] Use local/home version"
+                echo "  [c] Cancel (skip this file)"
+                read -p "Choose [r/l/c]: " -n 1 -r
                 echo
                 
                 case "$REPLY" in
-                    y|Y)
+                    r|R)
                         mv "$temp_file" "$repo_file"
                         return 0
                         ;;
-                    n|N)
+                    l|L)
                         rm -f "$temp_file"
                         return 1
                         ;;
@@ -1097,17 +1102,24 @@ resolve_two_way_conflict() {
                 case "$REPLY" in
                     m|M)
                         print_info "Opening $selected_tool for merge resolution..."
+                        print_info "Edit the RIGHT panel (repo version) and save it"
                         run_merge_tool "$selected_tool" "$home_file" "$temp_file"
-                        read -p "Use merged version? [y/n]: " -n 1 -r
+                        echo
+                        echo "Which version? [r]epo/merged, [l]ocal/home, [c]ancel"
+                        read -p "Choose [r/l/c]: " -n 1 -r
                         echo
                         case "$REPLY" in
-                            y|Y)
+                            r|R)
                                 mv "$temp_file" "$repo_file"
                                 return 0
                                 ;;
-                            *)
+                            l|L)
                                 rm -f "$temp_file"
                                 return 1
+                                ;;
+                            *)
+                                rm -f "$temp_file"
+                                return 2
                                 ;;
                         esac
                         ;;
@@ -1168,20 +1180,26 @@ resolve_two_way_conflict() {
                     selected_tool="${tool_array[$((choice-1))]%%:*}"
                     
                     print_info "Opening $selected_tool for merge resolution..."
+                    print_info "Edit the RIGHT panel (repo version) and save it"
                     run_merge_tool "$selected_tool" "$home_file" "$temp_file"
                     
                     echo
-                    read -p "Use merged version? [y/n]: " -n 1 -r
+                    echo "Which version? [r]epo/merged, [l]ocal/home, [c]ancel"
+                    read -p "Choose [r/l/c]: " -n 1 -r
                     echo
                     
                     case "$REPLY" in
-                        y|Y)
+                        r|R)
                             mv "$temp_file" "$repo_file"
                             return 0
                             ;;
-                        *)
+                        l|L)
                             rm -f "$temp_file"
                             return 1
+                            ;;
+                        *)
+                            rm -f "$temp_file"
+                            return 2
                             ;;
                     esac
                 else
@@ -1238,6 +1256,17 @@ perform_two_way_sync() {
         exit 5
     fi
     
+    cd "$N0DOM_REPO_PATH" || exit 5
+    
+    if [[ -n $(git status --porcelain 2>/dev/null) ]] && git rev-parse --verify HEAD &> /dev/null; then
+        print_warning "Uncommitted changes detected in repository"
+        print_info "This may indicate a previous sync was interrupted"
+        if ! confirm_action "Continue with sync?" "y"; then
+            print_info "Sync cancelled. Resolve uncommitted changes manually."
+            exit 5
+        fi
+    fi
+    
     if ! acquire_lock 30; then
         exit 5
     fi
@@ -1266,7 +1295,20 @@ perform_two_way_sync() {
                     print_warning "Could not fast-forward pull. There may be remote changes."
                     print_info "Attempting standard pull..."
                     if ! git pull origin "$current_branch"; then
-                        print_error "Failed to pull from remote. Resolve conflicts manually."
+                        print_error "Failed to pull from remote."
+                        if git diff --name-only --diff-filter=U 2>/dev/null | head -1 | grep -q .; then
+                            print_error "Merge conflicts detected in the following files:"
+                            git diff --name-only --diff-filter=U 2>/dev/null | head -10
+                            print_info "Resolve conflicts manually with: git mergetool or git add <file>"
+                        fi
+                        N0DOM_SYNC_ROLLBACK="true"
+                        exit 5
+                    fi
+                    
+                    if git diff --name-only --diff-filter=U 2>/dev/null | head -1 | grep -q .; then
+                        print_error "Pull created merge conflicts that need resolution"
+                        git diff --name-only --diff-filter=U 2>/dev/null
+                        print_info "Resolve conflicts and run sync again"
                         N0DOM_SYNC_ROLLBACK="true"
                         exit 5
                     fi
@@ -1405,7 +1447,7 @@ perform_two_way_sync() {
         local repo_file="$N0DOM_REPO_PATH/$file"
         local home_file="$HOME/$file"
         
-        safe_remove "$home_file" "existing file"
+        safe_remove "$home_file" "existing file" || true
         
         mkdir -p "$(dirname "$home_file")"
         ln -s "$repo_file" "$home_file"
@@ -1420,12 +1462,13 @@ perform_two_way_sync() {
         cp -r "$home_file" "$repo_file"
         git add "$file"
         
-        safe_remove "$home_file" "original file"
+        safe_remove "$home_file" "original file" || true
         ln -s "$repo_file" "$home_file"
         print_success "Tracked & linked: $file"
     done
     
     local conflicts_resolved=0
+    local conflicts_failed=0
     for file in "${conflicts[@]}"; do
         local repo_file="$N0DOM_REPO_PATH/$file"
         local home_file="$HOME/$file"
@@ -1435,27 +1478,44 @@ perform_two_way_sync() {
         
         case $result in
             0)
-                safe_remove "$home_file" "conflicting file"
+                git add "$file"
+                safe_remove "$home_file" "conflicting file" || true
                 mkdir -p "$(dirname "$home_file")"
                 ln -s "$repo_file" "$home_file"
-                print_success "Resolved (repo): $file"
-                ((conflicts_resolved++)) || true
+                if [[ -L "$home_file" ]]; then
+                    print_success "Resolved (repo): $file"
+                    ((conflicts_resolved++)) || true
+                else
+                    print_error "Failed to create symlink for: $file"
+                    ((conflicts_failed++)) || true
+                fi
                 ;;
             1)
                 cp -r "$home_file" "$repo_file"
                 git add "$file"
-                safe_remove "$home_file" "original file"
+                safe_remove "$home_file" "original file" || true
                 ln -s "$repo_file" "$home_file"
-                print_success "Resolved (home): $file"
-                ((conflicts_resolved++)) || true
+                if [[ -L "$home_file" ]]; then
+                    print_success "Resolved (home): $file"
+                    ((conflicts_resolved++)) || true
+                else
+                    print_error "Failed to create symlink for: $file"
+                    ((conflicts_failed++)) || true
+                fi
                 ;;
             *)
-                print_warning "Skipped: $file"
+                print_warning "Skipped: $file (will remain in conflict state)"
+                print_info "Run sync again to resolve this file"
                 ;;
         esac
     done
     
-    if [[ ${#home_only[@]} -gt 0 || $conflicts_resolved -gt 0 ]] || git diff --quiet --cached 2>/dev/null || [[ -n $(git status --porcelain 2>/dev/null) ]]; then
+    local has_staged=false
+    git diff --quiet --cached 2>/dev/null || has_staged=true
+    local has_unstaged=false
+    [[ -n $(git status --porcelain 2>/dev/null) ]] && has_unstaged=true
+    
+    if [[ ${#home_only[@]} -gt 0 || $conflicts_resolved -gt 0 ]] || [[ "$has_staged" == "true" ]] || [[ "$has_unstaged" == "true" ]]; then
         print_info "Committing changes..."
         git add -A
         git commit -m "$message" || print_warning "Nothing to commit"
@@ -1485,6 +1545,9 @@ perform_two_way_sync() {
     echo "  Newly linked: ${#repo_only[@]}"
     echo "  Newly tracked: ${#home_only[@]}"
     echo "  Conflicts resolved: $conflicts_resolved"
+    if [[ $conflicts_failed -gt 0 ]]; then
+        echo "  Conflicts failed: $conflicts_failed"
+    fi
     
     trap - EXIT
     release_lock
@@ -1554,6 +1617,37 @@ track_file() {
     if git ls-files "$rel_path" | grep -q "^${rel_path}$"; then
         print_warning "Already tracking: $rel_path"
         return 0
+    fi
+    
+    if [[ -L "$abs_path" ]]; then
+        local link_target
+        link_target=$(readlink "$abs_path" 2>/dev/null || echo "")
+        
+        if [[ -z "$link_target" ]]; then
+            print_error "Cannot read symlink target: $abs_path"
+            exit 5
+        fi
+        
+        if [[ ! -e "$abs_path" ]]; then
+            print_error "Broken symlink detected: $abs_path"
+            print_info "Target does not exist: $link_target"
+            exit 5
+        fi
+        
+        if [[ "$link_target" == "$N0DOM_REPO_PATH"* ]]; then
+            print_warning "File is already symlinked to the repo: $rel_path"
+            print_info "The file is already managed by n0dom. No action needed."
+            
+            if ! git ls-files "$rel_path" | grep -q "^${rel_path}$"; then
+                print_info "Adding to git tracking..."
+                git add "$rel_path"
+                print_success "Now tracking: $rel_path"
+            fi
+            return 0
+        fi
+        
+        print_warning "File is a symlink to: $link_target"
+        print_info "The actual file will be copied to the repo, not the symlink"
     fi
     
     local repo_file="${N0DOM_REPO_PATH}/${rel_path}"
@@ -1836,6 +1930,12 @@ show_status() {
         
         local home_file="$HOME/$file"
         local repo_file="$N0DOM_REPO_PATH/$file"
+        
+        # Skip broken symlinks in repo (file exists as symlink but target doesn't)
+        if [[ -L "$repo_file" ]] && [[ ! -e "$repo_file" ]]; then
+            ((total_files--)) || true
+            continue
+        fi
         
         if [[ ! -e "$repo_file" ]]; then
             ((deleted_from_repo++)) || true
