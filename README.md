@@ -6,7 +6,7 @@
 
 *Simplify your configuration management with intelligent two-way sync*
 
-[![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)](https://github.com/noeltz/n0dom)
+[![Version](https://img.shields.io/badge/version-1.3.1-blue.svg)](https://github.com/noeltz/n0dom)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Arch Linux](https://img.shields.io/badge/Arch%20Linux-supported-1793d1.svg)](https://archlinux.org)
 
@@ -418,7 +418,7 @@ $ n0dom doctor --check
 Optional YAML configuration at `~/.config/n0dom/config.yaml`:
 
 ```yaml
-version: "1.3.0"
+version: "1.3.1"
 
 repo:
   url: "https://github.com/username/dotfiles"
